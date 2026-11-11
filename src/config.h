@@ -15,7 +15,9 @@
 #endif
 
 // 4-Channel Relays (Active-LOW: 0V = ON, 3.3V = OFF)
-constexpr uint8_t RELAY_PINS[4] = {4, 5, 6, 7};
+constexpr uint8_t RELAY_PINS[4]    = {4, 5, 6, 7};
+// 4-Channel Soft Start Relays (Active-LOW: 0V = ON, 3.3V = OFF)
+constexpr uint8_t RELAY_SS_PINS[4] = {8, 14, 15, 16};
 
 // 6x Tactile Push Buttons (INPUT_PULLUP, Pin to GND)
 constexpr uint8_t BTN_PINS[4]   = {10, 11, 12, 13};
@@ -25,10 +27,6 @@ constexpr uint8_t BTN_RESET_KWH = 21;
 // Audio Buzzer (LEDC PWM / Digital Alert)
 constexpr uint8_t PIN_BUZZER    = 2;
 constexpr uint8_t PIN_RGB_LED   = 48; // Onboard WS2812 RGB LED (ESP32-S3 DevKitC-1)
-
-// Onboard YD-ESP32-S3 Dedicated LEDs (Active-LOW: LOW=ON, HIGH=OFF)
-constexpr uint8_t PIN_LED_GREEN = 43; // TX LED (Green) -> Indikator Beban CPU (PC HDD Style)
-constexpr uint8_t PIN_LED_BLUE  = 44; // RX LED (Blue)  -> Indikator Heartbeat & Proteksi WDT
 
 // PZEM-004T v4.0 UART Pins (Hardware Serial 1 di ESP32-S3)
 // Pin ditukar: RX=17, TX=18
@@ -95,6 +93,7 @@ constexpr float DEFAULT_FREQ_MAX        = 53.0f;  // Hz
 constexpr uint32_t BTN_HOLD_TOGGLE_MS   = 2500; // Tahan 2s toggle individual
 constexpr uint32_t BTN_HOLD_RESET_MS    = 5000; // Tahan 5s reset energy
 constexpr uint32_t SEQUENCER_DELAY_MS   = 2500; // Jeda 2s per channel sequencer
+constexpr uint32_t DEFAULT_SOFTSTART_DELAY_MS = 1000; // Jeda 1000ms pre-charge sebelum relay utama ON
 constexpr uint32_t POWERON_STABILIZE_MS = 5000; // Pantau kestabilan tegangan 5s pasca jeglek
 
 // ========================================================
@@ -147,7 +146,10 @@ struct TelemetryData {
     float pf;
     float energy;
     float chipTemp; // Suhu internal ESP32-S3 (°C)
-    float cpuLoad;  // Estimasi beban CPU (%)
+    float cpuLoad;  // Estimasi beban CPU rata-rata (%)
+    float cpuLoad0; // Estimasi beban Core 0 (Network / Web / Blynk) (%)
+    float cpuLoad1; // Estimasi beban Core 1 (Control / PZEM / Relays) (%)
+    uint16_t cpuFreq; // Frekuensi CPU Clock (MHz)
     bool relayStates[4];
     SystemState sysState;
     SequencerState seqState;
@@ -158,6 +160,7 @@ struct TelemetryData {
 // 5B. STRUKTUR RIWAYAT TELEMETRI PSRAM & BLACKBOX NVS
 // ========================================================
 #define PSRAM_HISTORY_MAX_POINTS 3600 // 1 Jam buffer resolusi 1-detik (86.4 KB di Octal PSRAM)
+#define BLACKBOX_MAX_RECORDS     10   // Ring buffer 10 riwayat trip di Flash NVS
 
 struct TelemetryHistoryPoint {
     uint32_t timestamp;  // Uptime detik
@@ -171,6 +174,7 @@ struct TelemetryHistoryPoint {
 
 struct BlackboxRecord {
     uint32_t magic;         // 0x50445542 ("PDUB")
+    uint32_t bootCount;     // Counter boot saat kejadian
     uint32_t timestamp;     // Uptime detik saat kejadian
     uint8_t  tripReason;    // SystemState (UVLO, SURGE, OCP, BLACKOUT)
     uint8_t  rstReason;     // esp_reset_reason_t
@@ -178,7 +182,9 @@ struct BlackboxRecord {
     float    current;       // Arus saat trip
     float    power;         // Daya saat trip
     float    chipTemp;      // Suhu chip saat trip
-    uint8_t  relayStates;   // Status relay sebelum diputus
+    float    minVolt5s;     // Tegangan minimum dalam 5 detik sebelum trip
+    float    maxVolt5s;     // Tegangan maksimum dalam 5 detik sebelum trip
+    uint8_t  relayStates;   // Status relay sebelum diputus (bit 0..3)
     char     tripLabel[32]; // Nama teks penyebab
 };
 

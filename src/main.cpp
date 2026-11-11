@@ -43,6 +43,8 @@ static uint16_t modbusCRC16(const uint8_t *buf, uint16_t len) {
     return crc;
 }
 
+static uint32_t s_pzemSleepMicros = 0;
+
 static bool rawReadPzem(float &volt, float &curr, float &pwr, float &nrg, float &frq, float &pf, uint8_t targetAddr) {
     uint8_t query[8] = {targetAddr, 0x04, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x00};
     uint16_t crc = modbusCRC16(query, 6);
@@ -59,12 +61,14 @@ static bool rawReadPzem(float &volt, float &curr, float &pwr, float &nrg, float 
     uint8_t resp[32];
     uint8_t idx = 0;
     uint32_t start = millis();
-    // Naikkan window wait ke 350ms agar optocoupler PZEM sempat merespon
-    while ((millis() - start < 350) && (idx < 25)) {
+    // 150ms window: 25 byte pada 9600 baud hanya butuh 26ms. 150ms sangat cukup dan tidak bikin CPU lag
+    while ((millis() - start < 150) && (idx < 25)) {
         if (PzemSerial.available()) {
             resp[idx++] = PzemSerial.read();
         } else {
+            uint32_t slpStart = micros();
             vTaskDelay(pdMS_TO_TICKS(5));
+            s_pzemSleepMicros += (micros() - slpStart);
         }
     }
 
@@ -137,6 +141,13 @@ float g_threshFmin   = DEFAULT_FREQ_MIN;
 float g_threshFmax   = DEFAULT_FREQ_MAX;
 uint32_t g_seqDelayMs = SEQUENCER_DELAY_MS;
 uint32_t g_btnHoldMs  = BTN_HOLD_TOGGLE_MS;
+uint32_t g_softStartDelayMs = DEFAULT_SOFTSTART_DELAY_MS;
+
+// Blynk Modular Configuration (NVS Loaded)
+String g_blynkAuthToken = BLYNK_AUTH_TOKEN;
+String g_blynkTemplateId = BLYNK_TEMPLATE_ID;
+bool g_blynkEnabled = true;
+volatile bool g_blynkNeedReconnect = false;
 
 // Klien ESP-NOW Management
 ClientNodeInfo clientList[ESPNOW_MAX_CLIENTS];
@@ -156,6 +167,7 @@ String g_staPass = "";
 volatile bool g_wifiNeedReconnect = false;
 
 // ========================================================
+// ========================================================
 // PSRAM 1-SECOND TELEMETRY LOGGER & BLACKBOX NVS
 // ========================================================
 TelemetryHistoryPoint *psramHistoryBuffer = nullptr;
@@ -163,8 +175,65 @@ uint16_t psramHistoryHead = 0;
 uint16_t psramHistoryCount = 0;
 portMUX_TYPE historyMux = portMUX_INITIALIZER_UNLOCKED;
 
+// Boot Tracking & 10-Event Ring Buffer di Flash NVS
+uint32_t g_bootCount = 0;
+esp_reset_reason_t g_mcuResetReason = ESP_RST_UNKNOWN;
+BlackboxRecord g_tripRecords[BLACKBOX_MAX_RECORDS] = {};
+uint8_t g_tripCount = 0;
+uint8_t g_tripHead = 0;
 BlackboxRecord g_lastTripRecord = {};
 bool g_hasTripRecord = false;
+
+// ========================================================
+// RTC FAST MEMORY BREADCRUMBS (Survives WDT & Panic Resets)
+// ========================================================
+RTC_NOINIT_ATTR static uint32_t rtcMagic;
+RTC_NOINIT_ATTR static uint8_t  crumbNet;   // Posisi terakhir Core 0 (Network & Blynk)
+RTC_NOINIT_ATTR static uint8_t  crumbCtl;   // Posisi terakhir Core 1 (Control & PZEM)
+RTC_NOINIT_ATTR static uint32_t lastUptimeS;
+RTC_NOINIT_ATTR static uint32_t rtcBootCount;
+
+// Snapshot diagnostik boot sebelumnya (diekspos ke /api/status & UI)
+uint32_t g_lastRstReason = 0;
+uint8_t  g_lastCrumbNet  = 0;
+uint8_t  g_lastCrumbCtl  = 0;
+uint32_t g_lastUptimeS   = 0;
+
+// Rolling Window 5 Detik (10 Sampel @ 500ms) untuk Rekam Min/Max Voltase sebelum Trip
+#define VOLT_WINDOW_5S_SIZE 10
+static float g_voltWindow5s[VOLT_WINDOW_5S_SIZE] = {0};
+static uint8_t g_voltWindowIdx = 0;
+static uint8_t g_voltWindowCount = 0;
+static portMUX_TYPE voltWindowMux = portMUX_INITIALIZER_UNLOCKED;
+
+void recordVoltSample5s(float v) {
+    if (v > 0.0f) {
+        portENTER_CRITICAL(&voltWindowMux);
+        g_voltWindow5s[g_voltWindowIdx] = v;
+        g_voltWindowIdx = (g_voltWindowIdx + 1) % VOLT_WINDOW_5S_SIZE;
+        if (g_voltWindowCount < VOLT_WINDOW_5S_SIZE) g_voltWindowCount++;
+        portEXIT_CRITICAL(&voltWindowMux);
+    }
+}
+
+void getVoltMinMax5s(float &minV, float &maxV, float fallbackV) {
+    portENTER_CRITICAL(&voltWindowMux);
+    float lo = 999.0f;
+    float hi = 0.0f;
+    for (uint8_t i = 0; i < g_voltWindowCount; i++) {
+        float sample = g_voltWindow5s[i];
+        if (sample > 0.0f) {
+            if (sample < lo) lo = sample;
+            if (sample > hi) hi = sample;
+        }
+    }
+    portEXIT_CRITICAL(&voltWindowMux);
+
+    if (lo > 900.0f) lo = fallbackV;
+    if (hi == 0.0f) hi = fallbackV;
+    minV = lo;
+    maxV = hi;
+}
 
 // Driver RGB Status Visualizer (GPIO 48) - Dibatasi Kecerahan Maksimal 40%
 void updateRgbStatus(SystemState sys, SequencerState seq, float temp) {
@@ -183,88 +252,71 @@ void updateRgbStatus(SystemState sys, SequencerState seq, float temp) {
     }
 }
 
-// Status Indikator CPU & WDT (LED Hijau GPIO 43 & LED Biru GPIO 44)
-volatile float g_estimatedCpuLoad = 5.0f;
-volatile uint32_t g_lastWdtPetTime = 0;
+// Status Indikator CPU
+volatile float g_estimatedCpuLoad = 3.0f; // Core 1 Load (Control & PZEM)
+volatile float g_core0Load = 3.0f;        // Core 0 Load (Network & Web)
 volatile bool g_cpuActivityPulse = false;
-bool g_isWdtBootAlert = false;
 
-// Helper Kecerahan 40% untuk LED Onboard (Active-LOW via Hardware PWM LEDC/analogWrite)
-// Active-LOW: 255 = 100% HIGH (Mati), 153 = 60% HIGH / 40% LOW (40% Kecerahan)
-static inline void setOnboardLed(uint8_t pin, bool on) {
-    if (!on) {
-        analogWrite(pin, 255); // MATI TOTAL (HIGH)
-    } else {
-        analogWrite(pin, 153); // NYALA 40% BRIGHTNESS (PWM)
+// Helper teks penyebab reset hardware MCU
+const char* getResetReasonStr(uint8_t code) {
+    switch ((esp_reset_reason_t)code) {
+        case ESP_RST_POWERON:   return "Power-On Reset (Daya Masuk / Padam)";
+        case ESP_RST_EXT:       return "External Pin Reset (Tombol RST Fisik)";
+        case ESP_RST_SW:        return "Software Reboot (OTA / Web Command)";
+        case ESP_RST_PANIC:     return "Core Panic / Exception Crash";
+        case ESP_RST_INT_WDT:   return "Interrupt Watchdog Reset";
+        case ESP_RST_TASK_WDT:  return "Task Watchdog Reset (Task Freeze/Hang)";
+        case ESP_RST_WDT:       return "Other Watchdog Reset";
+        case ESP_RST_DEEPSLEEP: return "Deep-Sleep Wakeup";
+        case ESP_RST_BROWNOUT:  return "Brownout Reset (Tegangan DC Drop < 2.8V)";
+        case ESP_RST_SDIO:      return "SDIO Reset";
+        default:                return "Hardware Reset";
     }
 }
 
-// Driver LED Hijau (GPIO 43) - Indikator Beban CPU / PC Case Disk-Style (Kecerahan 40%)
-void updateCpuLoadLed(float load, uint32_t now) {
-    static uint32_t lastPulseOff = 0;
-    if (g_cpuActivityPulse) {
-        g_cpuActivityPulse = false;
-        lastPulseOff = now + 18;
-        setOnboardLed(PIN_LED_GREEN, true); // Active-LOW ON 40%
-        return;
+// Helper teks pelacak posisi terakhir breadcrumb RTC
+const char* getCrumbNetStr(uint8_t c) {
+    switch (c) {
+        case 1: return "WiFi & Blynk Housekeeping";
+        case 2: return "Check WiFi STA";
+        case 3: return "Blynk.connect() (Blocking Socket / DNS)";
+        case 4: return "Blynk.run()";
+        case 5: return "WiFi Reconnecting";
+        case 6: return "Telemetry Push to Blynk";
+        case 7: return "ESP-NOW & Pairing Check";
+        default: return "Idle / Normal";
     }
-    if (now < lastPulseOff) {
-        setOnboardLed(PIN_LED_GREEN, true);
-        return;
-    }
-
-    uint32_t interval = 1200;
-    uint32_t onDuration = 18;
-
-    if (load > 65.0f) {
-        interval = 40;   // 25 Hz (Staccato fast flicker ala HDD load tinggi)
-        onDuration = 20;
-    } else if (load > 35.0f) {
-        interval = 90;   // ~11 Hz (Beban sedang)
-        onDuration = 35;
-    } else if (load > 15.0f) {
-        interval = 220;  // ~4.5 Hz
-        onDuration = 35;
-    }
-
-    uint32_t phase = now % interval;
-    bool shouldBeOn = (phase < onDuration);
-    setOnboardLed(PIN_LED_GREEN, shouldBeOn);
 }
 
-// Driver LED Biru (GPIO 44) - Indikator WDT Heartbeat & Safety Guard (Kecerahan 40%)
-void updateWdtLed(uint32_t now, uint32_t bootTimestamp) {
-    if (g_isWdtBootAlert && (now - bootTimestamp < 4000)) {
-        // Strobo 10 Hz menandakan reboot sebelumnya dipicu Watchdog / Panic
-        bool on = (now % 100) < 50;
-        setOnboardLed(PIN_LED_BLUE, on);
-        return;
+const char* getCrumbCtlStr(uint8_t c) {
+    switch (c) {
+        case 1: return "Command Queue & Mutex";
+        case 2: return "Soft Start Monitor";
+        case 3: return "Scan Button Fisik";
+        case 4: return "PZEM Modbus UART Read";
+        case 5: return "Evaluasi Proteksi & Cutoff";
+        case 6: return "Sequencer FSM";
+        default: return "Idle / Normal";
     }
-
-    // Jika task kontrol macet / WDT tidak di-pet > 1200ms -> Matikan LED (Deadlock Indicator)
-    if (g_lastWdtPetTime == 0 || (now - g_lastWdtPetTime > 1200)) {
-        setOnboardLed(PIN_LED_BLUE, false); // OFF
-        return;
-    }
-
-    // Pola Detak Jantung Ganda (Lub-Dub Heartbeat 1 Hz):
-    // 0..45ms: ON | 45..110ms: OFF | 110..155ms: ON | 155..1000ms: OFF
-    uint32_t phase = now % 1000;
-    bool shouldBeOn = (phase < 45) || (phase >= 110 && phase < 155);
-    setOnboardLed(PIN_LED_BLUE, shouldBeOn);
 }
 
-// Simpan Blackbox ke NVS Flash saat terjadi insiden (Anti-Hilang saat Listrik Padam)
+// Simpan Blackbox ke NVS Flash saat terjadi insiden (Ring Buffer 10 Kejadian + Min/Max 5s)
 void saveBlackboxTrip(SystemState reason, const char* label, float v, float a, float w, float temp) {
+    float minV = v, maxV = v;
+    getVoltMinMax5s(minV, maxV, v);
+
     BlackboxRecord rec = {};
     rec.magic = 0x50445542; // "PDUB"
+    rec.bootCount = g_bootCount;
     rec.timestamp = millis() / 1000;
     rec.tripReason = (uint8_t)reason;
-    rec.rstReason = (uint8_t)esp_reset_reason();
+    rec.rstReason = (uint8_t)g_mcuResetReason;
     rec.voltage = v;
     rec.current = a;
     rec.power = w;
     rec.chipTemp = temp;
+    rec.minVolt5s = minV;
+    rec.maxVolt5s = maxV;
     uint8_t rBits = 0;
     for (int i = 0; i < 4; i++) { if (targetRelayStates[i]) rBits |= (1 << i); }
     rec.relayStates = rBits;
@@ -272,12 +324,28 @@ void saveBlackboxTrip(SystemState reason, const char* label, float v, float a, f
 
     Preferences pBb;
     pBb.begin("pdu_bb", false);
+
+    // 1. Simpan ke slot ring buffer (trip_0 .. trip_9)
+    String key = "trip_" + String(g_tripHead);
+    pBb.putBytes(key.c_str(), &rec, sizeof(rec));
+
+    // 2. Simpan juga legacy key "last_trip" untuk backwards compatibility
     pBb.putBytes("last_trip", &rec, sizeof(rec));
+
+    g_tripRecords[g_tripHead] = rec;
+    g_tripHead = (g_tripHead + 1) % BLACKBOX_MAX_RECORDS;
+    if (g_tripCount < BLACKBOX_MAX_RECORDS) g_tripCount++;
+
+    pBb.putUChar("head", g_tripHead);
+    pBb.putUChar("count", g_tripCount);
     pBb.end();
+
     g_lastTripRecord = rec;
     g_hasTripRecord = true;
-    Serial.printf("[BLACKBOX NVS] 🚨 Insiden Disimpan ke Flash: %s (V: %.1fV, A: %.2fA, Temp: %.1fC)\n",
-                  label, v, a, temp);
+    Serial.printf("[BLACKBOX NVS] 🚨 Insiden Disimpan ke Slot #%d (Total: %d): %s\n"
+                  "               V_Trip: %.1fV (Min5s: %.1fV, Max5s: %.1fV) | Arus: %.2fA | Suhu: %.1fC | Boot #%u | Reset: %s\n",
+                  (g_tripHead == 0 ? BLACKBOX_MAX_RECORDS - 1 : g_tripHead - 1), g_tripCount,
+                  label, v, minV, maxV, a, temp, g_bootCount, getResetReasonStr(rec.rstReason));
 }
 
 // HTTP Basic Authentication Helper
@@ -393,8 +461,9 @@ void TaskControlCore1(void *pvParameters) {
     esp_task_wdt_add(NULL);
 
     esp_reset_reason_t rstReason = esp_reset_reason();
-    bool isSoftwareReset = (rstReason == ESP_RST_SW);
-    Serial.printf("[CORE 1] MCU Reset Reason: %d (Software Reset = %s)\n", (int)rstReason, isSoftwareReset ? "YES" : "NO");
+    bool isFastRestore = (rstReason == ESP_RST_SW || rstReason == ESP_RST_TASK_WDT || 
+                          rstReason == ESP_RST_PANIC || rstReason == ESP_RST_INT_WDT || rstReason == ESP_RST_WDT);
+    Serial.printf("[CORE 1] MCU Reset Reason: %d (Fast Handover = %s)\n", (int)rstReason, isFastRestore ? "YES" : "NO");
 
     // Muat Thresholds & State dari NVS Flash
     bool savedRelayStates[4] = {false, false, false, false};
@@ -406,6 +475,7 @@ void TaskControlCore1(void *pvParameters) {
     g_threshFmax    = prefs.getFloat("fmax", DEFAULT_FREQ_MAX);
     g_seqDelayMs    = prefs.getUInt("seq_delay", SEQUENCER_DELAY_MS);
     g_btnHoldMs     = prefs.getUInt("btn_hold", BTN_HOLD_TOGGLE_MS);
+    g_softStartDelayMs = prefs.getUInt("ss_delay", DEFAULT_SOFTSTART_DELAY_MS);
 
     for (int i = 0; i < 4; i++) {
         relayCycleCount[i] = prefs.getUInt(("cyc_" + String(i)).c_str(), 0);
@@ -427,9 +497,9 @@ void TaskControlCore1(void *pvParameters) {
     DBG_PRINTLN("[CORE 1] 6x Button Pins (GPIO 10,11,12,13,9,21) di-set ke INPUT_PULLUP");
 
     // Sequencer FSM Variables
-    // Jika Software Reset (OTA), relay sudah menyala mulus, jangan masuk stabilizing!
+    // Jika Fast Handover (SW/WDT/Panic), relay sudah menyala mulus, jangan masuk stabilizing!
     SequencerState seqState = SEQ_IDLE;
-    if (!isSoftwareReset) {
+    if (!isFastRestore) {
         for (int i = 0; i < 4; i++) {
             if (savedRelayStates[i]) {
                 seqState = SEQ_POWERON_STABILIZING;
@@ -437,12 +507,15 @@ void TaskControlCore1(void *pvParameters) {
             }
         }
     } else {
-        Serial.println("[SEQUENCER] Seamless OTA Handover: Bypass Power-on Stabilizing (Beban Tetap Aktif)");
+        Serial.println("[SEQUENCER] Fast Handover (SW/WDT/Panic): Bypass Power-on Stabilizing (Beban Tetap Aktif)");
     }
 
-        uint32_t stabilizeStartTime = millis();
-        int8_t seqCurrentStep = -1;
-        uint32_t seqLastStepTime = 0;
+    uint32_t stabilizeStartTime = millis();
+    int8_t seqCurrentStep = -1;
+    uint8_t seqSubStep = 0;
+    uint32_t seqLastStepTime = 0;
+    static bool ssActive[4] = {false, false, false, false};
+    static uint32_t ssStartTime[4] = {0, 0, 0, 0};
 
     // Multisampling Fault Counters & Grace Period
     uint8_t uvloSamples = 0;
@@ -454,16 +527,17 @@ void TaskControlCore1(void *pvParameters) {
     uint32_t bootTimestamp = millis();
 
     for (;;) {
+        lastUptimeS = millis() / 1000;
         uint32_t loopStartMicros = micros();
         esp_task_wdt_reset();
-        g_lastWdtPetTime = millis();
         uint32_t now = millis();
 
         // ----------------------------------------------------
-                // 1. Cek Pesan Masuk dari Core 0 / Blynk / Web
-                // ----------------------------------------------------
-                PduCommand cmd;
-                if (xQueueReceive(pduCommandQueue, &cmd, 0) == pdPASS) {
+        // 1. Cek Pesan Masuk dari Core 0 / Blynk / Web
+        // ----------------------------------------------------
+        crumbCtl = 1; // Breadcrumb: Command Queue & Mutex
+        PduCommand cmd;
+        if (xQueueReceive(pduCommandQueue, &cmd, 0) == pdPASS) {
                     DBG_PRINTF("[QUEUE RX] Perintah Diterima di Core 1: Type=%d, Ch=%d, State=%d\n", cmd.type, cmd.channel, cmd.state);
             if (cmd.type == CMD_SET_RELAY && cmd.channel == 254) {
                 // Force Reset Sequencer ke IDLE
@@ -480,19 +554,33 @@ void TaskControlCore1(void *pvParameters) {
                 if (seqState != SEQ_IDLE) {
                     DBG_PRINTF("[INTERLOCK] ⚠️ Perintah Relay %d Ditolak: Sequencer Sedang Berjalan (seqState=%d)!\n", cmd.channel + 1, seqState);
                 } else {
-                    xSemaphoreTake(relayMutex, portMAX_DELAY);
-                    targetRelayStates[cmd.channel] = cmd.state;
-                    DBG_PIN_WRITE(RELAY_PINS[cmd.channel], cmd.state ? LOW : HIGH, ("Relay Ch " + String(cmd.channel + 1)).c_str());
-                    relayCycleCount[cmd.channel]++;
+                    if (cmd.state) {
+                        // Nyalakan via Soft Start (Pre-charge)
+                        if (!targetRelayStates[cmd.channel] && !ssActive[cmd.channel]) {
+                            ssActive[cmd.channel] = true;
+                            ssStartTime[cmd.channel] = now;
+                            DBG_PIN_WRITE(RELAY_SS_PINS[cmd.channel], LOW, ("SoftStart ON Ch " + String(cmd.channel + 1)).c_str());
+                            DBG_PRINTF("[SOFT START] ⚡ Ch %d Soft Start Active! Menunggu %u ms sebelum Relay Utama ON...\n", 
+                                       cmd.channel + 1, g_softStartDelayMs);
+                        }
+                    } else {
+                        // Matikan segera (Keduanya: Relay Utama & Soft Start)
+                        ssActive[cmd.channel] = false;
+                        xSemaphoreTake(relayMutex, portMAX_DELAY);
+                        targetRelayStates[cmd.channel] = false;
+                        DBG_PIN_WRITE(RELAY_PINS[cmd.channel], HIGH, ("Relay Main OFF Ch " + String(cmd.channel + 1)).c_str());
+                        DBG_PIN_WRITE(RELAY_SS_PINS[cmd.channel], HIGH, ("SoftStart OFF Ch " + String(cmd.channel + 1)).c_str());
+                        relayCycleCount[cmd.channel]++;
 
-                    Preferences pStore;
-                    pStore.begin("pdu_store", false);
-                    pStore.putBool(("rl_" + String(cmd.channel)).c_str(), cmd.state);
-                    pStore.putUInt(("cyc_" + String(cmd.channel)).c_str(), relayCycleCount[cmd.channel]);
-                    pStore.end();
-                    xSemaphoreGive(relayMutex);
-                    DBG_PRINTF("[CORE 1 CMD] Relay %d Diubah ke -> %s (Total Siklus: %u)\n", 
-                               cmd.channel + 1, cmd.state ? "ON" : "OFF", relayCycleCount[cmd.channel]);
+                        Preferences pStore;
+                        pStore.begin("pdu_store", false);
+                        pStore.putBool(("rl_" + String(cmd.channel)).c_str(), false);
+                        pStore.putUInt(("cyc_" + String(cmd.channel)).c_str(), relayCycleCount[cmd.channel]);
+                        pStore.end();
+                        xSemaphoreGive(relayMutex);
+                        DBG_PRINTF("[CORE 1 CMD] Relay %d Diubah ke -> OFF (Total Siklus: %u)\n", 
+                                   cmd.channel + 1, relayCycleCount[cmd.channel]);
+                    }
                 }
             }
             else if (cmd.type == CMD_TRIGGER_SEQUENCER) {
@@ -511,6 +599,7 @@ void TaskControlCore1(void *pvParameters) {
                     } else {
                         seqState = SEQ_STARTING_UP;
                         seqCurrentStep = 0; // Dari channel 1 maju ke 4
+                        seqSubStep = 0;
                         for (int i = 0; i < 4; i++) savedRelayStates[i] = true; // Nyalakan semua pada trigger manual
                     }
                     seqLastStepTime = now - g_seqDelayMs; // Picu channel pertama langsung tanpa jeda awal tambahan!
@@ -525,18 +614,21 @@ void TaskControlCore1(void *pvParameters) {
                 currentTelemetry.sysState = STATE_FAILSAFE;
                 // Sesuai requirement: Ketika error di MCU langsung masuk error mode, semua relay aktif
                 for (int i = 0; i < 4; i++) {
+                    ssActive[i] = false;
                     DBG_PIN_WRITE(RELAY_PINS[i], LOW, ("Failsafe Relay " + String(i + 1)).c_str());
+                    DBG_PIN_WRITE(RELAY_SS_PINS[i], HIGH, ("Failsafe SS OFF " + String(i + 1)).c_str());
                     targetRelayStates[i] = true;
                 }
                 logEvent("FAILSAFE TRIGGERED: All Relays Latched ON");
             }
             else if (cmd.type == CMD_RELOAD_THRESHOLDS) {
                 prefs.begin("pdu_store", false);
-                g_threshUvlo    = prefs.getFloat("uvlo", DEFAULT_UVLO_VOLT);
-                g_threshSurge   = prefs.getFloat("surge", DEFAULT_SURGE_VOLT);
-                g_threshOcp     = prefs.getFloat("ocp", DEFAULT_OCP_CURRENT);
-                g_seqDelayMs    = prefs.getUInt("seq_delay", SEQUENCER_DELAY_MS);
-                g_btnHoldMs     = prefs.getUInt("btn_hold", BTN_HOLD_TOGGLE_MS);
+                g_threshUvlo       = prefs.getFloat("uvlo", DEFAULT_UVLO_VOLT);
+                g_threshSurge      = prefs.getFloat("surge", DEFAULT_SURGE_VOLT);
+                g_threshOcp        = prefs.getFloat("ocp", DEFAULT_OCP_CURRENT);
+                g_seqDelayMs       = prefs.getUInt("seq_delay", SEQUENCER_DELAY_MS);
+                g_btnHoldMs        = prefs.getUInt("btn_hold", BTN_HOLD_TOGGLE_MS);
+                g_softStartDelayMs = prefs.getUInt("ss_delay", DEFAULT_SOFTSTART_DELAY_MS);
                 prefs.end();
                 // Reset counter sampel seketika agar tidak tertahan fault lama
                 surgeSamples = 0;
@@ -550,9 +642,33 @@ void TaskControlCore1(void *pvParameters) {
             }
         }
 
+        // ----------------------------------------------------
+        // Monitor Selesainya Pre-charge Soft Start Per Channel
+        // ----------------------------------------------------
+        crumbCtl = 2; // Breadcrumb: Soft Start Pre-charge Monitor
+        for (int i = 0; i < 4; i++) {
+            if (ssActive[i] && (now - ssStartTime[i] >= g_softStartDelayMs)) {
+                ssActive[i] = false;
+                xSemaphoreTake(relayMutex, portMAX_DELAY);
+                targetRelayStates[i] = true;
+                DBG_PIN_WRITE(RELAY_PINS[i], LOW, ("Relay Main ON Ch " + String(i + 1)).c_str());
+                DBG_PIN_WRITE(RELAY_SS_PINS[i], HIGH, ("SoftStart OFF Ch " + String(i + 1)).c_str());
+                relayCycleCount[i]++;
+
+                Preferences pStore;
+                pStore.begin("pdu_store", false);
+                pStore.putBool(("rl_" + String(i)).c_str(), true);
+                pStore.putUInt(("cyc_" + String(i)).c_str(), relayCycleCount[i]);
+                pStore.end();
+                xSemaphoreGive(relayMutex);
+                DBG_PRINTF("[SOFT START] ✅ Ch %d Main Relay ON! (Pre-charge Selesai, Resistor By-passed)\n", i + 1);
+            }
+        }
+
         // ========================================================
         // 1. SCAN TOMBOL FISIK (WAJIB TEKAN TAHAN 2 DETIK)
         // ========================================================
+        crumbCtl = 3; // Breadcrumb: Scan Tombol Fisik
         static uint32_t btnPressStartTime[4] = {0, 0, 0, 0};
         static bool btnExecuted[4] = {false, false, false, false};
         static uint32_t masterPressStartTime = 0;
@@ -575,22 +691,31 @@ void TaskControlCore1(void *pvParameters) {
                     // SUDAH DITEKAN TAHAN SESUAI g_btnHoldMs! Eksekusi toggle relay langsung
                     btnExecuted[i] = true;
                     if (seqState == SEQ_POWERON_STABILIZING) seqState = SEQ_IDLE; // User ambil kendali manual
-                    xSemaphoreTake(relayMutex, portMAX_DELAY);
-                    bool newState = !targetRelayStates[i];
-                    targetRelayStates[i] = newState;
-                    DBG_PIN_WRITE(RELAY_PINS[i], newState ? LOW : HIGH, ("Relay Ch " + String(i + 1)).c_str());
-                    relayCycleCount[i]++;
+                    bool isCurrentlyActive = targetRelayStates[i] || ssActive[i];
+                    if (!isCurrentlyActive) {
+                        // Nyalakan dengan Soft Start
+                        ssActive[i] = true;
+                        ssStartTime[i] = now;
+                        DBG_PIN_WRITE(RELAY_SS_PINS[i], LOW, ("Btn SoftStart ON Ch " + String(i + 1)).c_str());
+                        DBG_PRINTF("[BTN 2S TRIGGER] ⚡ Tombol Ch %d Sukses Ditahan! Soft Start Active (%u ms)...\n", 
+                                   i + 1, g_softStartDelayMs);
+                    } else {
+                        // Matikan langsung
+                        ssActive[i] = false;
+                        xSemaphoreTake(relayMutex, portMAX_DELAY);
+                        targetRelayStates[i] = false;
+                        DBG_PIN_WRITE(RELAY_PINS[i], HIGH, ("Relay Main OFF Ch " + String(i + 1)).c_str());
+                        DBG_PIN_WRITE(RELAY_SS_PINS[i], HIGH, ("SoftStart OFF Ch " + String(i + 1)).c_str());
+                        relayCycleCount[i]++;
 
-                    Preferences pStore;
-                    pStore.begin("pdu_store", false);
-                    pStore.putBool(("rl_" + String(i)).c_str(), newState);
-                    pStore.putUInt(("cyc_" + String(i)).c_str(), relayCycleCount[i]);
-                    pStore.end();
-                    xSemaphoreGive(relayMutex);
-
-                    // Status relay disinkronkan ke Blynk secara aman via telemetryQueue di Core 0
-                    DBG_PRINTF("[BTN 2S TRIGGER] ✅ Tombol Ch %d (GPIO %d) Sukses Ditahan 2 Detik! Relay -> %s\n", 
-                               i + 1, BTN_PINS[i], newState ? "ON" : "OFF");
+                        Preferences pStore;
+                        pStore.begin("pdu_store", false);
+                        pStore.putBool(("rl_" + String(i)).c_str(), false);
+                        pStore.putUInt(("cyc_" + String(i)).c_str(), relayCycleCount[i]);
+                        pStore.end();
+                        xSemaphoreGive(relayMutex);
+                        DBG_PRINTF("[BTN 2S TRIGGER] ✅ Tombol Ch %d Sukses Ditahan 2 Detik! Relay -> OFF\n", i + 1);
+                    }
                 }
             } else {
                 // Tombol dilepas
@@ -630,6 +755,7 @@ void TaskControlCore1(void *pvParameters) {
                     } else {
                         seqState = SEQ_STARTING_UP;
                         seqCurrentStep = 0;
+                        seqSubStep = 0;
                         seqLastStepTime = now - g_seqDelayMs; // Langsung picu step pertama tanpa delay tambahan!
                         for (int i = 0; i < 4; i++) savedRelayStates[i] = true;
                         DBG_PRINTLN("[BTN MASTER 2.5S] ✅ Master Button 2.5s -> Memicu Sequence ON Bertahap!");
@@ -698,6 +824,7 @@ void TaskControlCore1(void *pvParameters) {
         }
 
         // 3. Baca Sensor PZEM-004T v4.0 via Modbus RTU Engine
+        crumbCtl = 4; // Breadcrumb: Baca PZEM UART Modbus
         if (now - lastPzemCheck >= 500) {
             lastPzemCheck = now;
             float v = NAN, a = NAN, w = NAN, e = NAN, f = NAN, pf = NAN;
@@ -709,8 +836,8 @@ void TaskControlCore1(void *pvParameters) {
             // Coba alamat aktif (0xF8 broadcast factory default)
             readOk = rawReadPzem(v, a, w, e, f, pf, activePzemAddr);
 
-            // Jika timeout berkali-kali (>= 3x berturut-turut), baru coba probe alamat alternatif (0x01)
-            if (!readOk && pzemConsecutiveFails >= 3) {
+            // Jika timeout berkali-kali, hanya probe alamat alternatif setiap 10 siklus (jangan tiap 500ms agar CPU tidak tersedot)
+            if (!readOk && (pzemConsecutiveFails % 10 == 3)) {
                 uint8_t altAddr = (activePzemAddr == 0xF8) ? 0x01 : 0xF8;
                 if (rawReadPzem(v, a, w, e, f, pf, altAddr)) {
                     activePzemAddr = altAddr;
@@ -734,6 +861,7 @@ void TaskControlCore1(void *pvParameters) {
                 currentTelemetry.energy    = e;
                 currentTelemetry.frequency = f;
                 currentTelemetry.pf        = pf;
+                recordVoltSample5s(v); // Rekam ke rolling buffer 5 detik untuk analisis sag vs glitch
             } else {
                 pzemConsecutiveFails++;
                 // KEBAL NOISE: JANGAN langsung nolkan voltase pada 1-3 packet drop / glitch serial sesaat!
@@ -773,6 +901,7 @@ void TaskControlCore1(void *pvParameters) {
             }
 
             // Evaluasi Proteksi hanya jika tegangan AC terdeteksi (>50V)
+            crumbCtl = 5; // Breadcrumb: Evaluasi Proteksi Kelistrikan & Cutoff
             if (currentTelemetry.voltage > 50.0f) {
                 blackoutSamples = 0; // Reset counter blackout jika tegangan normal
                 // Evaluasi Counter Fault (dengan floor 50V agar tidak false UVLO saat bench test tanpa AC)
@@ -809,11 +938,15 @@ void TaskControlCore1(void *pvParameters) {
                     xSemaphoreTake(relayMutex, portMAX_DELAY);
                     bool anyWasOn = false;
                     for (int i = 0; i < 4; i++) {
+                        ssActive[i] = false;
                         if (targetRelayStates[i]) {
                             savedRelayStates[i] = true; // Simpan state untuk auto-recovery
                             DBG_PIN_WRITE(RELAY_PINS[i], HIGH, ("TRIP OFF Relay " + String(i + 1)).c_str());
+                            DBG_PIN_WRITE(RELAY_SS_PINS[i], HIGH, ("TRIP OFF SoftStart " + String(i + 1)).c_str());
                             targetRelayStates[i] = false;
                             anyWasOn = true;
+                        } else {
+                            DBG_PIN_WRITE(RELAY_SS_PINS[i], HIGH, ("TRIP OFF SoftStart " + String(i + 1)).c_str());
                         }
                     }
                     xSemaphoreGive(relayMutex);
@@ -852,11 +985,15 @@ void TaskControlCore1(void *pvParameters) {
                         xSemaphoreTake(relayMutex, portMAX_DELAY);
                         bool anyWasOn = false;
                         for (int i = 0; i < 4; i++) {
+                            ssActive[i] = false;
                             if (targetRelayStates[i]) {
                                 savedRelayStates[i] = true; // Simpan state relay aktif sebelum blackout
                                 DBG_PIN_WRITE(RELAY_PINS[i], HIGH, ("BLACKOUT OFF Relay " + String(i + 1)).c_str());
+                                DBG_PIN_WRITE(RELAY_SS_PINS[i], HIGH, ("BLACKOUT OFF SoftStart " + String(i + 1)).c_str());
                                 targetRelayStates[i] = false;
                                 anyWasOn = true;
+                            } else {
+                                DBG_PIN_WRITE(RELAY_SS_PINS[i], HIGH, ("BLACKOUT OFF SoftStart " + String(i + 1)).c_str());
                             }
                         }
                         xSemaphoreGive(relayMutex);
@@ -886,6 +1023,7 @@ void TaskControlCore1(void *pvParameters) {
         // ----------------------------------------------------
         // 3. Sequencer Non-Blocking FSM
         // ----------------------------------------------------
+        crumbCtl = 6; // Breadcrumb: Sequencer Non-Blocking FSM
         if (seqState == SEQ_POWERON_STABILIZING) {
             bool isVoltageNormal = (currentTelemetry.voltage >= g_threshUvlo && currentTelemetry.voltage <= g_threshSurge);
             
@@ -909,7 +1047,8 @@ void TaskControlCore1(void *pvParameters) {
                 if (hasRelayToRestore) {
                     seqState = SEQ_STARTING_UP;
                     seqCurrentStep = 0;
-                    seqLastStepTime = now;
+                    seqSubStep = 0;
+                    seqLastStepTime = now - g_seqDelayMs; // Langsung picu step pertama
                     Serial.println("[POWER-ON] Relay aktif terdeteksi! Memulai SEQ_STARTING_UP bertahap...");
                 } else {
                     seqState = SEQ_IDLE; // Tidak ada relay yang perlu dinyalakan
@@ -918,85 +1057,108 @@ void TaskControlCore1(void *pvParameters) {
             }
         }
         else if (seqState == SEQ_STARTING_UP) {
+            if (seqCurrentStep >= 0 && seqCurrentStep < 4) {
+                if (!savedRelayStates[seqCurrentStep]) {
+                    DBG_PRINTF("[SEQUENCER ON] Ch %d DILAWATI (Previously OFF)\n", seqCurrentStep + 1);
+                    seqCurrentStep++;
+                    seqSubStep = 0;
+                    seqLastStepTime = now;
+                } else if (seqSubStep == 0) {
+                    // Tahap 1: Nyalakan Soft Start Relay (Pre-charge)
                     if (now - seqLastStepTime >= g_seqDelayMs) {
+                        DBG_PIN_WRITE(RELAY_SS_PINS[seqCurrentStep], LOW, ("Seq SS ON Ch " + String(seqCurrentStep + 1)).c_str());
+                        DBG_PRINTF("[SEQUENCER ON] ⚡ Ch %d Soft Start ON (Pre-charge %u ms)...\n", seqCurrentStep + 1, g_softStartDelayMs);
                         seqLastStepTime = now;
-                        if (seqCurrentStep >= 0 && seqCurrentStep < 4) {
-                            // Hanya nyalakan channel yang sebelumnya memang berstatus ON
-                            if (savedRelayStates[seqCurrentStep]) {
-                                xSemaphoreTake(relayMutex, portMAX_DELAY);
-                                targetRelayStates[seqCurrentStep] = true;
-                                DBG_PIN_WRITE(RELAY_PINS[seqCurrentStep], LOW, ("Seq ON Relay " + String(seqCurrentStep + 1)).c_str());
-                                relayCycleCount[seqCurrentStep]++;
-                                Preferences pStore;
-                                pStore.begin("pdu_store", false);
-                                pStore.putBool(("rl_" + String(seqCurrentStep)).c_str(), true);
-                                pStore.putUInt(("cyc_" + String(seqCurrentStep)).c_str(), relayCycleCount[seqCurrentStep]);
-                                pStore.end();
-                                xSemaphoreGive(relayMutex);
-                                DBG_PRINTF("[SEQUENCER ON] Ch %d NYALA (Restored)\n", seqCurrentStep + 1);
-                            } else {
-                                DBG_PRINTF("[SEQUENCER ON] Ch %d DILAWATI (Previously OFF)\n", seqCurrentStep + 1);
-                            }
-                            seqCurrentStep++;
-                        } else {
-                            seqState = SEQ_IDLE;
-                            // Bersihkan flag savedRelayStates setelah sequence restore selesai
-                            for (int i = 0; i < 4; i++) savedRelayStates[i] = false;
-                            Serial.println("[SEQUENCER] Startup Sequence Finished.");
-                        }
+                        seqSubStep = 1;
+                    }
+                } else if (seqSubStep == 1) {
+                    // Tahap 2: Nyalakan Relay Utama dan matikan Soft Start Relay
+                    if (now - seqLastStepTime >= g_softStartDelayMs) {
+                        xSemaphoreTake(relayMutex, portMAX_DELAY);
+                        targetRelayStates[seqCurrentStep] = true;
+                        DBG_PIN_WRITE(RELAY_PINS[seqCurrentStep], LOW, ("Seq Main ON Ch " + String(seqCurrentStep + 1)).c_str());
+                        DBG_PIN_WRITE(RELAY_SS_PINS[seqCurrentStep], HIGH, ("Seq SS OFF Ch " + String(seqCurrentStep + 1)).c_str());
+                        relayCycleCount[seqCurrentStep]++;
+                        Preferences pStore;
+                        pStore.begin("pdu_store", false);
+                        pStore.putBool(("rl_" + String(seqCurrentStep)).c_str(), true);
+                        pStore.putUInt(("cyc_" + String(seqCurrentStep)).c_str(), relayCycleCount[seqCurrentStep]);
+                        pStore.end();
+                        xSemaphoreGive(relayMutex);
+                        DBG_PRINTF("[SEQUENCER ON] ✅ Ch %d MAIN NYALA (SoftStart Selesai)\n", seqCurrentStep + 1);
+
+                        seqLastStepTime = now;
+                        seqCurrentStep++;
+                        seqSubStep = 0;
                     }
                 }
+            } else {
+                seqState = SEQ_IDLE;
+                seqSubStep = 0;
+                // Bersihkan flag savedRelayStates setelah sequence restore selesai
+                for (int i = 0; i < 4; i++) savedRelayStates[i] = false;
+                Serial.println("[SEQUENCER] Startup Sequence Finished.");
+            }
+        }
         else if (seqState == SEQ_SHUTTING_DOWN) {
-                    if (now - seqLastStepTime >= g_seqDelayMs) {
-                        seqLastStepTime = now;
-                        if (seqCurrentStep >= 0 && seqCurrentStep < 4) {
-                            xSemaphoreTake(relayMutex, portMAX_DELAY);
-                            targetRelayStates[seqCurrentStep] = false;
-                            DBG_PIN_WRITE(RELAY_PINS[seqCurrentStep], HIGH, ("Seq OFF Relay " + String(seqCurrentStep + 1)).c_str());
-                            relayCycleCount[seqCurrentStep]++;
-                            Preferences pStore;
-                            pStore.begin("pdu_store", false);
-                            pStore.putBool(("rl_" + String(seqCurrentStep)).c_str(), false);
-                            pStore.putUInt(("cyc_" + String(seqCurrentStep)).c_str(), relayCycleCount[seqCurrentStep]);
-                            pStore.end();
-                            xSemaphoreGive(relayMutex);
-                            DBG_PRINTF("[SEQUENCER OFF] Ch %d MATI\n", seqCurrentStep + 1);
-                            seqCurrentStep--;
-                        } else {
-                            seqState = SEQ_IDLE;
-                            Serial.println("[SEQUENCER] Shutdown Sequence Finished.");
-                        }
-                    }
+            if (now - seqLastStepTime >= g_seqDelayMs) {
+                seqLastStepTime = now;
+                if (seqCurrentStep >= 0 && seqCurrentStep < 4) {
+                    xSemaphoreTake(relayMutex, portMAX_DELAY);
+                    targetRelayStates[seqCurrentStep] = false;
+                    DBG_PIN_WRITE(RELAY_PINS[seqCurrentStep], HIGH, ("Seq OFF Main Ch " + String(seqCurrentStep + 1)).c_str());
+                    DBG_PIN_WRITE(RELAY_SS_PINS[seqCurrentStep], HIGH, ("Seq OFF SS Ch " + String(seqCurrentStep + 1)).c_str());
+                    relayCycleCount[seqCurrentStep]++;
+                    Preferences pStore;
+                    pStore.begin("pdu_store", false);
+                    pStore.putBool(("rl_" + String(seqCurrentStep)).c_str(), false);
+                    pStore.putUInt(("cyc_" + String(seqCurrentStep)).c_str(), relayCycleCount[seqCurrentStep]);
+                    pStore.end();
+                    xSemaphoreGive(relayMutex);
+                    DBG_PRINTF("[SEQUENCER OFF] Ch %d MATI\n", seqCurrentStep + 1);
+                    seqCurrentStep--;
+                } else {
+                    seqState = SEQ_IDLE;
+                    Serial.println("[SEQUENCER] Shutdown Sequence Finished.");
                 }
+            }
+        }
 
         // 4. Update Audio Alert & LED Indikator Hardware
         updateBuzzer(currentTelemetry.sysState);
-        updateCpuLoadLed(g_estimatedCpuLoad, now);
-        updateWdtLed(now, bootTimestamp);
 
         // Selalu sinkronkan state FSM sequencer terbaru ke struct telemetri di setiap tick
         currentTelemetry.seqState = seqState;
 
-        // Estimasi beban kerja CPU di Core 1
+        // Estimasi beban kerja CPU di Core 1 (PZEM, FSM, Actuator)
         static uint32_t s_workAccum = 0;
         static uint32_t s_winStart = 0;
         uint32_t loopWorkMicros = micros() - loopStartMicros;
+        if (loopWorkMicros > s_pzemSleepMicros) loopWorkMicros -= s_pzemSleepMicros;
+        else loopWorkMicros = 0;
+        s_pzemSleepMicros = 0;
         s_workAccum += loopWorkMicros;
 
-        if (now - s_winStart >= 300) {
+        if (s_winStart == 0) s_winStart = now;
+        if (now - s_winStart >= 1000) {
             uint32_t elapsed = (now - s_winStart) * 1000;
             if (elapsed > 0) {
                 float rawLoad = (float)s_workAccum * 100.0f / (float)elapsed;
-                rawLoad += 4.5f; // Baseline overhead FreeRTOS scheduler & background Wi-Fi LwIP
+                rawLoad += 1.5f; // Baseline overhead FreeRTOS scheduler
                 g_estimatedCpuLoad = (g_estimatedCpuLoad * 0.7f) + (rawLoad * 0.3f);
-                if (g_estimatedCpuLoad < 2.0f) g_estimatedCpuLoad = 2.0f;
+                if (g_estimatedCpuLoad < 1.0f) g_estimatedCpuLoad = 1.0f;
                 if (g_estimatedCpuLoad > 100.0f) g_estimatedCpuLoad = 100.0f;
-                currentTelemetry.cpuLoad = g_estimatedCpuLoad;
+
+                currentTelemetry.cpuLoad1 = g_estimatedCpuLoad;
+                currentTelemetry.cpuLoad0 = g_core0Load;
+                currentTelemetry.cpuLoad = (g_core0Load + g_estimatedCpuLoad) / 2.0f;
+                currentTelemetry.cpuFreq = ESP.getCpuFreqMHz();
             }
             s_workAccum = 0;
             s_winStart = now;
         }
 
+        crumbCtl = 0; // Breadcrumb: Core 1 Idle / Tick Selesai
         vTaskDelay(10 / portTICK_PERIOD_MS);
     }
 }
@@ -1156,7 +1318,22 @@ void TaskNetworkCore0(void *pvParameters) {
     } else {
         Serial.println("[WIFI] Belum ada WiFi router tersimpan. Beroperasi murni AP Mode.");
     }
-    Blynk.config(BLYNK_AUTH_TOKEN);
+
+    // Muat Konfigurasi Blynk dari NVS Flash
+    Preferences pBlynk;
+    pBlynk.begin("pdu_store", true);
+    g_blynkAuthToken  = pBlynk.getString("blynk_tok", BLYNK_AUTH_TOKEN);
+    g_blynkTemplateId = pBlynk.getString("blynk_tmpl", BLYNK_TEMPLATE_ID);
+    g_blynkEnabled    = pBlynk.getBool("blynk_en", true);
+    pBlynk.end();
+
+    if (g_blynkEnabled && g_blynkAuthToken.length() > 0) {
+        Blynk.config(g_blynkAuthToken.c_str());
+        Serial.printf("[BLYNK] Inisialisasi: TemplateID=%s | Token=%s (Status: Aktif)\n", 
+                      g_blynkTemplateId.c_str(), g_blynkAuthToken.c_str());
+    } else {
+        Serial.println("[BLYNK] Dinonaktifkan di Flash NVS.");
+    }
 
     // Inisialisasi mDNS "electric-pdu.local"
     if (MDNS.begin(MDNS_HOSTNAME)) {
@@ -1170,10 +1347,12 @@ void TaskNetworkCore0(void *pvParameters) {
         TelemetryData localData = {0};
 
         for (;;) {
+            uint32_t loopStartMicros0 = micros();
             esp_task_wdt_reset();
             uint32_t now = millis();
 
             // 0. Soft-Reconnect Live jika Wi-Fi baru disimpan via Web UI (Zero Downtime)
+            crumbNet = 1; // Breadcrumb: WiFi & Blynk config housekeeping
             if (g_wifiNeedReconnect) {
                 g_wifiNeedReconnect = false;
                 Serial.printf("[WIFI LIVE] Menerapkan konfigurasi Wi-Fi baru: \"%s\" tanpa reboot MCU...\n", g_staSsid.c_str());
@@ -1185,39 +1364,65 @@ void TaskNetworkCore0(void *pvParameters) {
                 lastStaCheck = now;
             }
 
-            // 1. Non-Blocking Wi-Fi & Blynk Connection Manager
-                        if (WiFi.status() == WL_CONNECTED) {
-                            uint8_t staCh = WiFi.channel();
-                            // Pastikan mDNS juga di-init / di-update saat STA connect ke router
-                            static bool mdnsStaStarted = false;
-                            if (!mdnsStaStarted) {
-                                mdnsStaStarted = true;
-                                MDNS.end();
-                                if (MDNS.begin(MDNS_HOSTNAME)) {
-                                    MDNS.addService("http", "tcp", 80);
-                                    Serial.printf("[MDNS] Re-registered via Router STA: http://%s.local (%s)\n", 
-                                                  MDNS_HOSTNAME, WiFi.localIP().toString().c_str());
-                                }
-                            }
-                            static uint8_t lastKnownCh = 0;
-                            if (staCh != 0 && staCh != lastKnownCh) {
-                                lastKnownCh = staCh;
-                                Serial.printf("[WIFI] Router aktif di Channel: %d. Mengunci frekuensi ESP-NOW ke Ch %d\n", staCh, staCh);
-                            }
-
-                            if (!Blynk.connected()) {
-                    if (now - lastBlynkConnectAttempt >= 5000) {
-                        lastBlynkConnectAttempt = now;
-                        Serial.println("[BLYNK] Mencoba connect ke server Blynk...");
-                        Blynk.connect(1500); // 1.5-second timeout non-blocking
-                        if (Blynk.connected()) {
-                            Serial.println("[BLYNK] BERHASIL ONLINE KE BLYNK CLOUD! 🟢");
-                        }
-                    }
+            // 0b. Live Update Konfigurasi Blynk jika diubah via Web UI (Zero Downtime)
+            if (g_blynkNeedReconnect) {
+                g_blynkNeedReconnect = false;
+                if (Blynk.connected()) {
+                    Blynk.disconnect();
+                }
+                if (g_blynkEnabled && g_blynkAuthToken.length() > 0) {
+                    Blynk.config(g_blynkAuthToken.c_str());
+                    lastBlynkConnectAttempt = 0; // Trigger sambung segera
+                    Serial.printf("[BLYNK LIVE] Konfigurasi diterapkan: Token=\"%s\", Enabled=%s\n", 
+                                  g_blynkAuthToken.c_str(), g_blynkEnabled ? "YES" : "NO");
                 } else {
-                    Blynk.run();
+                    Serial.println("[BLYNK LIVE] Blynk dinonaktifkan.");
+                }
+            }
+
+            // 1. Non-Blocking Wi-Fi & Blynk Connection Manager
+            crumbNet = 2; // Breadcrumb: Checking Wi-Fi STA & mDNS
+            if (WiFi.status() == WL_CONNECTED) {
+                uint8_t staCh = WiFi.channel();
+                // Pastikan mDNS juga di-init / di-update saat STA connect ke router
+                static bool mdnsStaStarted = false;
+                if (!mdnsStaStarted) {
+                    mdnsStaStarted = true;
+                    MDNS.end();
+                    if (MDNS.begin(MDNS_HOSTNAME)) {
+                        MDNS.addService("http", "tcp", 80);
+                        Serial.printf("[MDNS] Re-registered via Router STA: http://%s.local (%s)\n", 
+                                      MDNS_HOSTNAME, WiFi.localIP().toString().c_str());
+                    }
+                }
+                static uint8_t lastKnownCh = 0;
+                if (staCh != 0 && staCh != lastKnownCh) {
+                    lastKnownCh = staCh;
+                    Serial.printf("[WIFI] Router aktif di Channel: %d. Mengunci frekuensi ESP-NOW ke Ch %d\n", staCh, staCh);
+                }
+
+                if (g_blynkEnabled && g_blynkAuthToken.length() > 0) {
+                    if (!Blynk.connected()) {
+                        if (now - lastBlynkConnectAttempt >= 5000) {
+                            lastBlynkConnectAttempt = now;
+                            Serial.println("[BLYNK] Mencoba connect ke server Blynk...");
+                            crumbNet = 3; // Breadcrumb: Di dalam Blynk.connect() (Tersangka TWDT #1)
+                            esp_task_wdt_reset(); // Feed WDT sebelum blokir socket/DNS!
+                            uint32_t connStart = micros();
+                            Blynk.connect(1500); // 1.5-second timeout non-blocking
+                            esp_task_wdt_reset(); // Feed WDT seketika setelah return!
+                            loopStartMicros0 += (micros() - connStart); // Exclude socket wait
+                            if (Blynk.connected()) {
+                                Serial.println("[BLYNK] BERHASIL ONLINE KE BLYNK CLOUD! 🟢");
+                            }
+                        }
+                    } else {
+                        crumbNet = 4; // Breadcrumb: Di dalam Blynk.run()
+                        Blynk.run();
+                    }
                 }
             } else {
+                crumbNet = 5; // Breadcrumb: Menghubungkan ulang Wi-Fi STA
                 // Jika STA terputus dan ada SSID tersimpan, coba reconnect setiap 15 detik
                 if (g_staSsid.length() > 0 && (now - lastStaCheck >= 15000)) {
                     lastStaCheck = now;
@@ -1226,10 +1431,16 @@ void TaskNetworkCore0(void *pvParameters) {
                 }
             }
 
-        // 2. Telemetry Sync ke Blynk Cloud
+            // 2. Telemetry Sync ke Blynk Cloud
+            crumbNet = 6; // Breadcrumb: Telemetry push ke Blynk Cloud
+        static bool lastRelayStateBlynk[4] = {false, false, false, false};
+        static SystemState lastSysStateBlynk = STATE_NORMAL;
+        static uint8_t lastClientCountBlynk = 255;
+
         if (xQueueReceive(telemetryQueue, &localData, 0) == pdPASS) {
-            if (now - lastCloudPush >= 1000 && Blynk.connected()) {
+            if (now - lastCloudPush >= 1000 && g_blynkEnabled && Blynk.connected()) {
                 lastCloudPush = now;
+                uint32_t blynkPushStart = micros();
                 Blynk.virtualWrite(VPIN_VOLT, localData.voltage);
                 Blynk.virtualWrite(VPIN_AMP, localData.current);
                 Blynk.virtualWrite(VPIN_WATT, localData.power);
@@ -1238,19 +1449,31 @@ void TaskNetworkCore0(void *pvParameters) {
                 Blynk.virtualWrite(VPIN_ENERGY, localData.energy);
 
                 for (int i = 0; i < 4; i++) {
-                    Blynk.virtualWrite(VPIN_LED[i], localData.relayStates[i] ? 255 : 0);
-                    // HANYA update widget switch jika tombol TIDAK sedang ditekan user di aplikasi (mencegah loopback race)
-                    if (blynkPressStart[i] == 0) {
-                        Blynk.virtualWrite(VPIN_RELAY[i], localData.relayStates[i] ? 1 : 0);
+                    if (localData.relayStates[i] != lastRelayStateBlynk[i]) {
+                        lastRelayStateBlynk[i] = localData.relayStates[i];
+                        Blynk.virtualWrite(VPIN_LED[i], localData.relayStates[i] ? 255 : 0);
+                        if (blynkPressStart[i] == 0) {
+                            Blynk.virtualWrite(VPIN_RELAY[i], localData.relayStates[i] ? 1 : 0);
+                        }
                     }
                 }
-                Blynk.virtualWrite(VPIN_ALARM_LED, (localData.sysState != STATE_NORMAL) ? 255 : 0);
-                Blynk.virtualWrite(VPIN_CLIENT_COUNT, registeredClientCount);
+                if (localData.sysState != lastSysStateBlynk) {
+                    lastSysStateBlynk = localData.sysState;
+                    Blynk.virtualWrite(VPIN_ALARM_LED, (localData.sysState != STATE_NORMAL) ? 255 : 0);
+                }
+                if (registeredClientCount != lastClientCountBlynk) {
+                    lastClientCountBlynk = registeredClientCount;
+                    Blynk.virtualWrite(VPIN_CLIENT_COUNT, registeredClientCount);
+                }
+                uint32_t blynkDuration = micros() - blynkPushStart;
+                if (blynkDuration > 1000) {
+                    loopStartMicros0 += (blynkDuration - 1000); // Sisakan 1ms komputasi wajar
+                }
             }
         }
 
         // 2b. Sync Telemetri Klien Sub-PDU Lt2 ke Blynk (Thread-Safe di Core 0)
-        if (g_blynkSyncSubPdu && Blynk.connected()) {
+        if (g_blynkSyncSubPdu && g_blynkEnabled && Blynk.connected()) {
             g_blynkSyncSubPdu = false;
             Blynk.virtualWrite(VPIN_CLIENT_UP_RL1, g_subPduLt2RelayState);
         }
@@ -1263,6 +1486,7 @@ void TaskNetworkCore0(void *pvParameters) {
         }
 
         // 3. Pairing Window Timeout (60 Detik)
+        crumbNet = 7; // Breadcrumb: ESP-NOW Pairing & Node Health-Check
         if (isPairingWindowActive && (now - pairingStartTime >= 60000)) {
             isPairingWindowActive = false;
             Serial.println("[PAIRING] Pairing window closed.");
@@ -1283,6 +1507,27 @@ void TaskNetworkCore0(void *pvParameters) {
                     }
                 }
 
+        // Estimasi beban kerja CPU di Core 0 (Network, AsyncTCP, & Blynk)
+        static uint32_t s_workAccum0 = 0;
+        static uint32_t s_winStart0 = 0;
+        uint32_t loopWorkMicros0 = micros() - loopStartMicros0;
+        s_workAccum0 += loopWorkMicros0;
+
+        if (s_winStart0 == 0) s_winStart0 = now;
+        if (now - s_winStart0 >= 1000) {
+            uint32_t elapsed0 = (now - s_winStart0) * 1000;
+            if (elapsed0 > 0) {
+                float rawLoad0 = (float)s_workAccum0 * 100.0f / (float)elapsed0;
+                rawLoad0 += 1.5f; // Baseline background LwIP TCP/IP stack overhead
+                g_core0Load = (g_core0Load * 0.7f) + (rawLoad0 * 0.3f);
+                if (g_core0Load < 1.0f) g_core0Load = 1.0f;
+                if (g_core0Load > 100.0f) g_core0Load = 100.0f;
+            }
+            s_workAccum0 = 0;
+            s_winStart0 = now;
+        }
+
+        crumbNet = 0; // Breadcrumb: Core 0 Idle / Tick Selesai
         vTaskDelay(20 / portTICK_PERIOD_MS);
     }
 }
@@ -1428,35 +1673,69 @@ static const char HTML_HEAD[] PROGMEM =
 // SETUP UTAMA
 // ========================================================
 void setup() {
+    setCpuFrequencyMhz(160); // Turunkan CPU clock ke 160MHz (Optimalisasi suhu dingin & power tanpa jitter)
     esp_brownout_init(); // Aktifkan hardware brownout detector untuk proteksi power supply toko 24/7
 
-    // 0. RESTORASI PIN RELAY SEGERA (0ms latency, sebelum serial & delay apapun)
+    // 0. DETEKSI & SIMPAN RESET REASON & COUNTER BOOT KE NVS FLASH PADA SETIAP BOOT
     esp_reset_reason_t rstReason = esp_reset_reason();
-    bool isSoftwareReset = (rstReason == ESP_RST_SW);
+    g_mcuResetReason = rstReason;
+    // Fast Restore: Pulihkan relay seketika (0ms) untuk SW reboot, WDT reboot, maupun Panic reboot
+    // Listrik beban toko tidak perlu mati 15+ detik jika reboot hanya karena watchdog/software!
+    bool isFastRestore = (rstReason == ESP_RST_SW || rstReason == ESP_RST_TASK_WDT || 
+                          rstReason == ESP_RST_PANIC || rstReason == ESP_RST_INT_WDT || rstReason == ESP_RST_WDT);
 
+    Preferences pBoot;
+    pBoot.begin("pdu_boot", false);
+    g_bootCount = pBoot.getUInt("count", 0) + 1;
+    pBoot.putUInt("count", g_bootCount);
+    pBoot.putUChar("last_rst", (uint8_t)rstReason);
+
+    // Ambil Breadcrumb dari RTC Memory (Selamat dari WDT & Panic reboot)
+    if (rtcMagic == 0xB00B1E55 && rstReason != ESP_RST_POWERON) {
+        g_lastRstReason = (uint32_t)rstReason;
+        g_lastCrumbNet  = crumbNet;
+        g_lastCrumbCtl  = crumbCtl;
+        g_lastUptimeS   = lastUptimeS;
+        pBoot.putUInt("rst", g_lastRstReason);
+        pBoot.putUChar("cNet", g_lastCrumbNet);
+        pBoot.putUChar("cCtl", g_lastCrumbCtl);
+        pBoot.putUInt("upS", g_lastUptimeS);
+    } else {
+        g_lastRstReason = pBoot.getUInt("rst", (uint32_t)rstReason);
+        g_lastCrumbNet  = pBoot.getUChar("cNet", 0);
+        g_lastCrumbCtl  = pBoot.getUChar("cCtl", 0);
+        g_lastUptimeS   = pBoot.getUInt("upS", 0);
+    }
+    pBoot.end();
+
+    // Reset RTC Memory untuk sesi boot berjalan sekarang
+    rtcMagic = 0xB00B1E55;
+    rtcBootCount = g_bootCount;
+    crumbNet = 0;
+    crumbCtl = 0;
+    lastUptimeS = 0;
+
+    // 0b. RESTORASI PIN RELAY SEGERA (0ms latency, sebelum serial & delay apapun)
     prefs.begin("pdu_store", true); // Mode read-only
     for (int i = 0; i < 4; i++) {
         bool lastState = prefs.getBool(("rl_" + String(i)).c_str(), false);
         targetRelayStates[i] = lastState;
-        if (isSoftwareReset && lastState) {
-            digitalWrite(RELAY_PINS[i], LOW); // Pertahankan ON tanpa kedip
+        if (isFastRestore && lastState) {
+            digitalWrite(RELAY_PINS[i], LOW); // Pertahankan/pulihkan ON seketika tanpa jeda
         } else {
-            digitalWrite(RELAY_PINS[i], HIGH); // OFF pada fresh power-on
+            digitalWrite(RELAY_PINS[i], HIGH); // OFF pada fresh power-on / brownout
             targetRelayStates[i] = false;
         }
         pinMode(RELAY_PINS[i], OUTPUT);
         gpio_hold_dis((gpio_num_t)RELAY_PINS[i]);
+
+        // Soft Start Relay selalu di-set OFF (HIGH) saat boot
+        digitalWrite(RELAY_SS_PINS[i], HIGH);
+        pinMode(RELAY_SS_PINS[i], OUTPUT);
+        gpio_hold_dis((gpio_num_t)RELAY_SS_PINS[i]);
     }
     gpio_deep_sleep_hold_dis();
     prefs.end();
-
-    // Inisialisasi LED Onboard YD-ESP32-S3 (GPIO 43 = Green/CPU Load, GPIO 44 = Blue/WDT)
-    setOnboardLed(PIN_LED_GREEN, false);
-    setOnboardLed(PIN_LED_BLUE, false);
-
-    if (rstReason == ESP_RST_TASK_WDT || rstReason == ESP_RST_WDT || rstReason == ESP_RST_PANIC) {
-        g_isWdtBootAlert = true;
-    }
 
     Serial.begin(115200);
     delay(500);
@@ -1481,19 +1760,43 @@ void setup() {
         Serial.println("[MEM INFO] ⚠️ PSRAM Tidak Terdeteksi atau Belum Aktif!");
     }
 
-    // Baca Riwayat Insiden Terakhir dari Flash NVS (Anti-Hilang saat Listrik Padam)
+    // Baca Riwayat Insiden & Ring Buffer 10 Kejadian dari Flash NVS
     Preferences pBb;
     pBb.begin("pdu_bb", true);
+    g_tripCount = pBb.getUChar("count", 0);
+    g_tripHead  = pBb.getUChar("head", 0);
+    if (g_tripCount > BLACKBOX_MAX_RECORDS) g_tripCount = BLACKBOX_MAX_RECORDS;
+    if (g_tripHead >= BLACKBOX_MAX_RECORDS) g_tripHead = 0;
+
+    for (uint8_t i = 0; i < g_tripCount; i++) {
+        String key = "trip_" + String(i);
+        if (pBb.isKey(key.c_str())) {
+            pBb.getBytes(key.c_str(), &g_tripRecords[i], sizeof(BlackboxRecord));
+        }
+    }
+
     if (pBb.isKey("last_trip")) {
         pBb.getBytes("last_trip", &g_lastTripRecord, sizeof(g_lastTripRecord));
         if (g_lastTripRecord.magic == 0x50445542) {
             g_hasTripRecord = true;
-            Serial.printf("[BLACKBOX BOOT] 🔍 Riwayat Trip Terakhir: %s | Uptime: %lus | Volt: %.1fV | Arus: %.2fA | Suhu: %.1fC | Reset: %d\n",
-                          g_lastTripRecord.tripLabel, (unsigned long)g_lastTripRecord.timestamp,
-                          g_lastTripRecord.voltage, g_lastTripRecord.current, g_lastTripRecord.chipTemp, g_lastTripRecord.rstReason);
         }
+    } else if (g_tripCount > 0) {
+        uint8_t latestIdx = (g_tripHead == 0 ? g_tripCount - 1 : g_tripHead - 1);
+        g_lastTripRecord = g_tripRecords[latestIdx];
+        g_hasTripRecord = (g_lastTripRecord.magic == 0x50445542);
     }
     pBb.end();
+
+    Serial.printf("[BOOT NVS] 🔄 Boot Counter: #%u | Reset Reason: %d (%s)\n", 
+                  g_bootCount, (int)rstReason, getResetReasonStr((uint8_t)rstReason));
+    Serial.printf("[BLACKBOX BOOT] 🔍 Memuat %d Riwayat Insiden dari Flash NVS (Head Slot: %d)\n", 
+                  g_tripCount, g_tripHead);
+    if (g_hasTripRecord) {
+        Serial.printf("[BLACKBOX BOOT] Insiden Terakhir: %s | Uptime: %lus | Volt: %.1fV (Min5s: %.1fV, Max5s: %.1fV) | Arus: %.2fA | Boot #%u | Reset: %s\n",
+                      g_lastTripRecord.tripLabel, (unsigned long)g_lastTripRecord.timestamp,
+                      g_lastTripRecord.voltage, g_lastTripRecord.minVolt5s, g_lastTripRecord.maxVolt5s,
+                      g_lastTripRecord.current, g_lastTripRecord.bootCount, getResetReasonStr(g_lastTripRecord.rstReason));
+    }
 
     // 1. Inisialisasi LittleFS File System
     if (!LittleFS.begin(true)) {
@@ -1508,7 +1811,7 @@ void setup() {
     relayMutex      = xSemaphoreCreateMutex();
 
     // 3. Inisialisasi Native ESP-IDF Task Watchdog Timer
-    esp_task_wdt_init(5, true); // 5 Detik timeout, panic reboot on hang
+    esp_task_wdt_init(15, true); // 15 Detik timeout (mencegah false panic saat DNS/Blynk blocking)
 
     // 4. Inisialisasi UART PZEM di HardwareSerial 1 (ESP32-S3)
     PzemSerial.setRxBufferSize(256);
@@ -1517,6 +1820,7 @@ void setup() {
 
     // 5. Inisialisasi WiFi Mode di setup() (Wajib di thread utama agar LwIP stabil)
     WiFi.mode(WIFI_AP_STA);
+    WiFi.setSleep(false); // Matikan 802.11 Modem Sleep agar respon HTTP Web & Ping instan tanpa drop!
 
     // ====================================================
     // 6. SETUP WEB SERVER 4 HALAMAN + REST API
@@ -1551,23 +1855,51 @@ void setup() {
         html += "<div class='metric'><div>Power Factor</div><div class='val' id='pf'>" + String(currentTelemetry.pf, 2) + "</div></div>";
         html += "<div class='metric'><div>Energi</div><div class='val' id='e'>" + String(currentTelemetry.energy, 2) + " kWh</div></div>";
         html += "<div class='metric'><div>Suhu ESP32-S3</div><div class='val' id='chip_temp'>" + String(currentTelemetry.chipTemp, 1) + " °C</div></div>";
-        html += "<div class='metric'><div>Beban CPU</div><div class='val' id='cpu_load'>" + String(currentTelemetry.cpuLoad, 0) + " %</div></div>";
+        html += "<div class='metric'><div>Clock CPU</div><div class='val' id='cpu_speed'>" + String(ESP.getCpuFreqMHz()) + " MHz</div></div>";
+        html += "<div class='metric'><div>Beban Core 0 (Net)</div><div class='val' id='cpu_load0'>" + String(currentTelemetry.cpuLoad0, 0) + " %</div></div>";
+        html += "<div class='metric'><div>Beban Core 1 (Ctrl)</div><div class='val' id='cpu_load1'>" + String(currentTelemetry.cpuLoad1, 0) + " %</div></div>";
         html += "</div></div>";
 
-        // KARTU BLACKBOX EVENT TRIP TERAKHIR (PERMANEN DI DASHBOARD)
+        // KARTU BLACKBOX EVENT TRIP TERAKHIR & RING BUFFER 10 KEJADIAN (PERMANEN DI DASHBOARD)
         html += "<div class='card' id='card_blackbox' style='border-left:5px solid " + String(g_hasTripRecord ? "#ef4444" : "#10b981") + ";'>";
         html += "<div style='display:flex;justify-content:space-between;align-items:center;'>";
-        html += "<h3 style='margin:0;' id='bb_title'>" + String(g_hasTripRecord ? "<span style='color:#f87171;'>🚨 Blackbox: Catatan Insiden Trip Terakhir</span>" : "<span style='color:#4ade80;'>🛡️ Blackbox: Status Proteksi Sistem</span>") + "</h3>";
-        html += "<button onclick=\"fetch('/api/reset-blackbox',{method:'POST'}).then(()=>{location.reload();})\" style='padding:4px 8px;font-size:11px;background:#475569;'>Reset Log</button></div>";
+        html += "<h3 style='margin:0;' id='bb_title'>" + String(g_hasTripRecord ? "<span style='color:#f87171;'>🚨 Blackbox: Catatan Insiden Trip (" + String(g_tripCount) + "/10)</span>" : "<span style='color:#4ade80;'>🛡️ Blackbox: Status Proteksi Sistem</span>") + "</h3>";
+        html += "<div><a href='/api/trips' target='_blank' style='margin-right:6px;'><button style='padding:4px 8px;font-size:11px;background:#0284c7;'>Raw JSON</button></a>";
+        html += "<button onclick=\"fetch('/api/reset-blackbox',{method:'POST'}).then(()=>{location.reload();})\" style='padding:4px 8px;font-size:11px;background:#475569;'>Reset Log</button></div></div>";
+
+        html += "<div style='font-size:12px;color:#94a3b8;margin-top:6px;'>Status MCU: Boot <b>#" + String(g_bootCount) + "</b> | Reset: <b>" + String(getResetReasonStr((uint8_t)g_mcuResetReason)) + "</b>";
+        if (g_lastCrumbNet > 0 || g_lastCrumbCtl > 0) {
+            html += "<br><span style='color:#38bdf8;'>🔍 <b>Breadcrumb Hang Terakhir:</b> Core 0 [<b>" + String(getCrumbNetStr(g_lastCrumbNet)) + "</b>] | Core 1 [<b>" + String(getCrumbCtlStr(g_lastCrumbCtl)) + "</b>] (Uptime: " + String(g_lastUptimeS) + "s)</span>";
+        }
+        html += "</div>";
+
         html += "<div style='font-size:13px;line-height:1.6;color:#cbd5e1;margin-top:10px;' id='bb_content'>";
         if (g_hasTripRecord) {
-            html += "<p style='margin:4px 0;'><b>Pemicu Trip:</b> <span style='color:#f87171;font-weight:bold;'>" + String(g_lastTripRecord.tripLabel) + "</span></p>";
-            html += "<p style='margin:4px 0;'><b>Tegangan saat Trip:</b> " + String(g_lastTripRecord.voltage, 1) + " V | <b>Arus:</b> " + String(g_lastTripRecord.current, 2) + " A | <b>Daya:</b> " + String(g_lastTripRecord.power, 0) + " W</p>";
-            html += "<p style='margin:4px 0;'><b>Suhu Chip ESP32:</b> " + String(g_lastTripRecord.chipTemp, 1) + " °C | <b>Waktu Uptime:</b> " + String(g_lastTripRecord.timestamp) + " detik</p>";
-            html += "<p style='margin:4px 0;'><b>Reset Reason Hardware:</b> Code " + String(g_lastTripRecord.rstReason) + "</p>";
+            html += "<p style='margin:4px 0;'><b>Insiden Terakhir:</b> <span style='color:#f87171;font-weight:bold;'>" + String(g_lastTripRecord.tripLabel) + "</span> (Boot #" + String(g_lastTripRecord.bootCount) + ")</p>";
+            html += "<p style='margin:4px 0;'><b>Tegangan saat Trip:</b> <span style='color:#fbbf24;font-weight:bold;'>" + String(g_lastTripRecord.voltage, 1) + " V</span> | <b>Jendela 5s:</b> Min " + String(g_lastTripRecord.minVolt5s, 1) + " V / Max " + String(g_lastTripRecord.maxVolt5s, 1) + " V</p>";
+            html += "<p style='margin:4px 0;'><b>Arus:</b> " + String(g_lastTripRecord.current, 2) + " A | <b>Daya:</b> " + String(g_lastTripRecord.power, 0) + " W | <b>Suhu:</b> " + String(g_lastTripRecord.chipTemp, 1) + " °C | <b>Uptime:</b> " + String(g_lastTripRecord.timestamp) + "s</p>";
+
+            if (g_tripCount > 1) {
+                html += "<div style='margin-top:10px;border-top:1px solid #334155;padding-top:8px;'><b>Riwayat " + String(g_tripCount) + " Kejadian Terakhir:</b>";
+                html += "<div style='max-height:140px;overflow-y:auto;margin-top:6px;'><table style='width:100%;font-size:11px;border-collapse:collapse;'>";
+                html += "<tr style='color:#94a3b8;text-align:left;border-bottom:1px solid #334155;'><th>#</th><th>Boot</th><th>Pemicu</th><th>V_Trip</th><th>5s (Min-Max)</th><th>Arus</th></tr>";
+                for (int i = 0; i < g_tripCount; i++) {
+                    int idx = (g_tripHead - 1 - i + BLACKBOX_MAX_RECORDS) % BLACKBOX_MAX_RECORDS;
+                    if (idx >= g_tripCount && g_tripCount < BLACKBOX_MAX_RECORDS) continue;
+                    const BlackboxRecord &r = g_tripRecords[idx];
+                    if (r.magic != 0x50445542) continue;
+                    html += "<tr style='border-bottom:1px solid #1e293b;'><td style='padding:3px 2px;'>" + String(i + 1) + "</td>";
+                    html += "<td>#" + String(r.bootCount) + "</td>";
+                    html += "<td style='color:#f87171;'>" + String(r.tripLabel) + "</td>";
+                    html += "<td style='color:#fbbf24;'>" + String(r.voltage, 1) + "V</td>";
+                    html += "<td>" + String(r.minVolt5s, 1) + " - " + String(r.maxVolt5s, 1) + "V</td>";
+                    html += "<td>" + String(r.current, 2) + "A</td></tr>";
+                }
+                html += "</table></div></div>";
+            }
         } else {
             html += "<p style='margin:4px 0;color:#4ade80;'>✅ <b>Kondisi Listrik Aman:</b> Belum ada catatan trip / cut-off pada sistem.</p>";
-            html += "<p style='margin:4px 0;color:#94a3b8;font-size:12px;'>Sistem siap merekam snapshot tegangan, arus, daya, dan suhu saat terjadi anomali kelistrikan.</p>";
+            html += "<p style='margin:4px 0;color:#94a3b8;font-size:12px;'>Sistem siap merekam snapshot tegangan (sag vs glitch 5 detik), arus, daya, dan suhu saat terjadi anomali kelistrikan.</p>";
         }
         html += "</div></div>";
 
@@ -1691,21 +2023,31 @@ void setup() {
                 "else if(d.chipTemp>=58.0)document.getElementById('chip_temp').style.color='#f97316';"
                 "else document.getElementById('chip_temp').style.color='#4ade80';"
                 "}"
-                "if(d.cpuLoad!==undefined&&document.getElementById('cpu_load')){"
-                "document.getElementById('cpu_load').innerText=d.cpuLoad.toFixed(0)+' %';"
-                "if(d.cpuLoad>=70.0)document.getElementById('cpu_load').style.color='#ef4444';"
-                "else if(d.cpuLoad>=35.0)document.getElementById('cpu_load').style.color='#f97316';"
-                "else document.getElementById('cpu_load').style.color='#38bdf8';"
+                "if(d.cpuSpeed!==undefined&&document.getElementById('cpu_speed'))document.getElementById('cpu_speed').innerText=d.cpuSpeed+' MHz';"
+                "if(d.cpuLoad0!==undefined&&document.getElementById('cpu_load0')){"
+                "document.getElementById('cpu_load0').innerText=d.cpuLoad0.toFixed(0)+' %';"
+                "if(d.cpuLoad0>=70.0)document.getElementById('cpu_load0').style.color='#ef4444';"
+                "else if(d.cpuLoad0>=35.0)document.getElementById('cpu_load0').style.color='#f97316';"
+                "else document.getElementById('cpu_load0').style.color='#38bdf8';"
+                "}"
+                "if(d.cpuLoad1!==undefined&&document.getElementById('cpu_load1')){"
+                "document.getElementById('cpu_load1').innerText=d.cpuLoad1.toFixed(0)+' %';"
+                "if(d.cpuLoad1>=70.0)document.getElementById('cpu_load1').style.color='#ef4444';"
+                "else if(d.cpuLoad1>=35.0)document.getElementById('cpu_load1').style.color='#f97316';"
+                "else document.getElementById('cpu_load1').style.color='#38bdf8';"
                 "}"
                 "if(document.getElementById('card_blackbox')){"
                 "if(d.hasTrip){"
                 "document.getElementById('card_blackbox').style.borderLeftColor='#ef4444';"
-                "if(document.getElementById('bb_title'))document.getElementById('bb_title').innerHTML='<span style=\"color:#f87171;\">🚨 Blackbox: Catatan Insiden Trip Terakhir</span>';"
-                "document.getElementById('bb_content').innerHTML='<p style=\"margin:4px 0;\"><b>Pemicu Trip:</b> <span style=\"color:#f87171;font-weight:bold;\">'+d.tripLabel+'</span></p>'+'<p style=\"margin:4px 0;\"><b>Tegangan saat Trip:</b> '+d.tripVolt.toFixed(1)+' V | <b>Arus:</b> '+d.tripCurr.toFixed(2)+' A</p>'+'<p style=\"margin:4px 0;\"><b>Suhu Chip ESP32:</b> '+d.tripTemp.toFixed(1)+' °C | <b>Waktu Uptime:</b> '+d.tripTime+' detik</p>';"
+                "if(document.getElementById('bb_title'))document.getElementById('bb_title').innerHTML='<span style=\"color:#f87171;\">🚨 Blackbox: Catatan Insiden Trip ('+(d.tripCount||1)+'/10)</span>';"
+                "var min5=(d.tripMinVolt5s!==undefined)?d.tripMinVolt5s.toFixed(1):'-';"
+                "var max5=(d.tripMaxVolt5s!==undefined)?d.tripMaxVolt5s.toFixed(1):'-';"
+                "var bNo=(d.tripBoot!==undefined)?d.tripBoot:'-';"
+                "document.getElementById('bb_content').innerHTML='<p style=\"margin:4px 0;\"><b>Insiden Terakhir:</b> <span style=\"color:#f87171;font-weight:bold;\">'+d.tripLabel+'</span> (Boot #'+bNo+')</p>'+'<p style=\"margin:4px 0;\"><b>Tegangan saat Trip:</b> <span style=\"color:#fbbf24;font-weight:bold;\">'+d.tripVolt.toFixed(1)+' V</span> | <b>Jendela 5s:</b> Min '+min5+' V / Max '+max5+' V</p>'+'<p style=\"margin:4px 0;\"><b>Arus:</b> '+d.tripCurr.toFixed(2)+' A | <b>Suhu:</b> '+d.tripTemp.toFixed(1)+' °C | <b>Uptime:</b> '+d.tripTime+' detik</p><p style=\"margin:4px 0;font-size:11px;color:#94a3b8;\">💡 Refresh untuk tabel 10 log lengkap atau buka <a href=\"/api/trips\" target=\"_blank\" style=\"color:#38bdf8;\">/api/trips</a></p>';"
                 "}else{"
                 "document.getElementById('card_blackbox').style.borderLeftColor='#10b981';"
                 "if(document.getElementById('bb_title'))document.getElementById('bb_title').innerHTML='<span style=\"color:#4ade80;\">🛡️ Blackbox: Status Proteksi Sistem</span>';"
-                "document.getElementById('bb_content').innerHTML='<p style=\"margin:4px 0;color:#4ade80;\">✅ <b>Kondisi Listrik Aman:</b> Belum ada catatan trip / cut-off pada sistem.</p><p style=\"margin:4px 0;color:#94a3b8;font-size:12px;\">Sistem siap merekam snapshot tegangan, arus, daya, dan suhu saat terjadi anomali kelistrikan.</p>';"
+                "document.getElementById('bb_content').innerHTML='<p style=\"margin:4px 0;color:#4ade80;\">✅ <b>Kondisi Listrik Aman:</b> Belum ada catatan trip / cut-off pada sistem.</p><p style=\"margin:4px 0;color:#94a3b8;font-size:12px;\">Sistem siap merekam snapshot tegangan (sag vs glitch 5 detik), arus, daya, dan suhu saat terjadi anomali kelistrikan.</p>';"
                 "}"
                 "}"
                 "});"
@@ -1812,8 +2154,16 @@ void setup() {
                 html += "<p>Batas Atas Surge (Volt AC):<br><input type='number' step='0.1' name='surge' value='" + String(g_threshSurge, 1) + "'></p>";
                 html += "<p>Batas Arus Maks OCP (Ampere MCB):<br><input type='number' step='0.1' name='ocp' value='" + String(g_threshOcp, 1) + "'></p>";
                 html += "<p>Jeda Waktu Sequencer (ms):<br><input type='number' step='100' name='seq_delay' value='" + String(g_seqDelayMs) + "'></p>";
+                html += "<p>Jeda Waktu Soft Start Pre-charge (ms):<br><input type='number' step='100' min='100' max='10000' name='ss_delay' value='" + String(g_softStartDelayMs) + "'></p>";
                 html += "<p>Durasi Tahan Tombol Fisik & Web (ms):<br><input type='number' step='100' min='500' max='10000' name='btn_hold' value='" + String(g_btnHoldMs) + "'></p>";
                 html += "<button type='submit'>Simpan Ambang Batas ke Flash</button></form></div>";
+
+                html += "<div class='card'><h3>Pengaturan Blynk IoT Cloud (Modular NVS)</h3>";
+                html += "<p>Status Cloud: <b>" + String(g_blynkEnabled ? (Blynk.connected() ? "<span style='color:#4ade80'>ONLINE 🟢</span>" : "<span style='color:#facc15'>CONNECTING / OFFLINE 🟡</span>") : "<span style='color:#ef4444'>DINONAKTIFKAN 🔴</span>") + "</b></p>";
+                html += "<p>Template ID Blynk:<br><input type='text' id='blynk_tmpl' value='" + g_blynkTemplateId + "' placeholder='TMPLxxxxxx'></p>";
+                html += "<p>Auth Token Blynk:<br><input type='text' id='blynk_tok' value='" + g_blynkAuthToken + "' placeholder='Masukkan Blynk Auth Token'></p>";
+                html += "<p style='margin:10px 0;'><label style='cursor:pointer;'><input type='checkbox' id='blynk_en' " + String(g_blynkEnabled ? "checked" : "") + "> Aktifkan Koneksi Blynk Cloud</label></p>";
+                html += "<button onclick=\"saveBlynk()\">Simpan Pengaturan Blynk</button></div>";
 
                 html += "<div class='card'><h3>Pengaturan Wi-Fi Router</h3>";
                         html += "<p>Hubungkan ESP32 ke Wi-Fi agar online ke Blynk Cloud:</p>";
@@ -1835,6 +2185,18 @@ void setup() {
                                 "fetch('/api/wifi-save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData})"
                                 ".then(r=>r.text()).then(t=>{alert(t);location.reload();})"
                                 ".catch(e=>{alert('Error: '+e);});"
+                                "}"
+                                "function saveBlynk(){"
+                                "var tm=document.getElementById('blynk_tmpl').value.trim();"
+                                "var t=document.getElementById('blynk_tok').value.trim();"
+                                "var e=document.getElementById('blynk_en').checked?'1':'0';"
+                                "var formData=new URLSearchParams();"
+                                "formData.append('tmpl',tm);"
+                                "formData.append('token',t);"
+                                "formData.append('en',e);"
+                                "fetch('/api/blynk-save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData})"
+                                ".then(r=>r.text()).then(txt=>{alert(txt);location.reload();})"
+                                ".catch(err=>{alert('Error: '+err);});"
                                 "}"
                                 "</script></body></html>";
                 request->send(200, "text/html; charset=utf-8", html);
@@ -1951,14 +2313,27 @@ void setup() {
                     // Ambil snapshot atomic agar bebas data race dengan Core 1
                     TelemetryData snap;
                     bool rSnap[4];
-                    xSemaphoreTake(relayMutex, portMAX_DELAY);
-                    snap = currentTelemetry;
-                    for (int i = 0; i < 4; i++) rSnap[i] = targetRelayStates[i];
-                    xSemaphoreGive(relayMutex);
+                    if (xSemaphoreTake(relayMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+                        snap = currentTelemetry;
+                        for (int i = 0; i < 4; i++) rSnap[i] = targetRelayStates[i];
+                        xSemaphoreGive(relayMutex);
+                    } else {
+                        snap = currentTelemetry;
+                        for (int i = 0; i < 4; i++) rSnap[i] = (digitalRead(RELAY_PINS[i]) == LOW);
+                    }
 
                     String json = "{";
                     json += "\"uptime\":" + String(millis() / 1000) + ",";
-                    json += "\"resetReason\":" + String((int)esp_reset_reason()) + ",";
+                    json += "\"bootCount\":" + String(g_bootCount) + ",";
+                    json += "\"resetReason\":" + String((int)g_mcuResetReason) + ",";
+                    json += "\"resetReasonStr\":\"" + String(getResetReasonStr((uint8_t)g_mcuResetReason)) + "\",";
+                    json += "\"lastRst\":" + String(g_lastRstReason) + ",";
+                    json += "\"lastRstStr\":\"" + String(getResetReasonStr((uint8_t)g_lastRstReason)) + "\",";
+                    json += "\"cNet\":" + String(g_lastCrumbNet) + ",";
+                    json += "\"cNetStr\":\"" + String(getCrumbNetStr(g_lastCrumbNet)) + "\",";
+                    json += "\"cCtl\":" + String(g_lastCrumbCtl) + ",";
+                    json += "\"cCtlStr\":\"" + String(getCrumbCtlStr(g_lastCrumbCtl)) + "\",";
+                    json += "\"upS\":" + String(g_lastUptimeS) + ",";
                     json += "\"btns\":[" + String(digitalRead(BTN_PINS[0])) + "," + String(digitalRead(BTN_PINS[1])) + "," +
                             String(digitalRead(BTN_PINS[2])) + "," + String(digitalRead(BTN_PINS[3])) + "," +
                             String(digitalRead(BTN_MASTER)) + "," + String(digitalRead(BTN_RESET_KWH)) + "],";
@@ -1970,19 +2345,28 @@ void setup() {
                     json += "\"pf\":" + String(snap.pf, 2) + ",";
                     g_cpuActivityPulse = true; // Picu flicker disk-style saat request masuk
                     json += "\"chipTemp\":" + String(snap.chipTemp, 1) + ",";
+                    json += "\"cpuSpeed\":" + String(snap.cpuFreq ? snap.cpuFreq : ESP.getCpuFreqMHz()) + ",";
+                    json += "\"cpuLoad0\":" + String(snap.cpuLoad0, 1) + ",";
+                    json += "\"cpuLoad1\":" + String(snap.cpuLoad1, 1) + ",";
                     json += "\"cpuLoad\":" + String(snap.cpuLoad, 1) + ",";
                     json += "\"sysState\":" + String(snap.sysState) + ",";
                     json += "\"seqState\":" + String(snap.seqState) + ",";
                     json += "\"clients\":" + String(registeredClientCount) + ",";
                     json += "\"wifiConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
-                    json += "\"blynkConnected\":" + String(Blynk.connected() ? "true" : "false") + ",";
+                    json += "\"blynkConnected\":" + String((g_blynkEnabled && Blynk.connected()) ? "true" : "false") + ",";
+                    json += "\"blynkEnabled\":" + String(g_blynkEnabled ? "true" : "false") + ",";
+                    json += "\"tripCount\":" + String(g_tripCount) + ",";
                     json += "\"hasTrip\":" + String(g_hasTripRecord ? "true" : "false") + ",";
                     if (g_hasTripRecord) {
                         json += "\"tripLabel\":\"" + String(g_lastTripRecord.tripLabel) + "\",";
                         json += "\"tripVolt\":" + String(g_lastTripRecord.voltage, 1) + ",";
+                        json += "\"tripMinVolt5s\":" + String(g_lastTripRecord.minVolt5s, 1) + ",";
+                        json += "\"tripMaxVolt5s\":" + String(g_lastTripRecord.maxVolt5s, 1) + ",";
                         json += "\"tripCurr\":" + String(g_lastTripRecord.current, 2) + ",";
                         json += "\"tripTemp\":" + String(g_lastTripRecord.chipTemp, 1) + ",";
                         json += "\"tripTime\":" + String(g_lastTripRecord.timestamp) + ",";
+                        json += "\"tripBoot\":" + String(g_lastTripRecord.bootCount) + ",";
+                        json += "\"tripRstReason\":" + String(g_lastTripRecord.rstReason) + ",";
                     }
                     json += "\"ssid\":\"" + WiFi.SSID() + "\",";
                     json += "\"ip\":\"" + (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : WiFi.softAPIP().toString()) + "\",";
@@ -2089,6 +2473,13 @@ void setup() {
             g_seqDelayMs = vSeq.toInt();
             prefs.putUInt("seq_delay", g_seqDelayMs);
         }
+        String vSs = getP(request, "ss_delay");
+        if (vSs.length() > 0) {
+            g_softStartDelayMs = vSs.toInt();
+            if (g_softStartDelayMs < 100) g_softStartDelayMs = 100;
+            if (g_softStartDelayMs > 10000) g_softStartDelayMs = 10000;
+            prefs.putUInt("ss_delay", g_softStartDelayMs);
+        }
         String vHold = getP(request, "btn_hold");
         if (vHold.length() > 0) {
             g_btnHoldMs = vHold.toInt();
@@ -2101,6 +2492,39 @@ void setup() {
         PduCommand cmd = {CMD_RELOAD_THRESHOLDS, 0, false};
         xQueueSend(pduCommandQueue, &cmd, 0);
         request->redirect("/recovery");
+    });
+
+    server.on("/api/blynk-save", HTTP_POST, [](AsyncWebServerRequest *request) {
+        if (!checkAuth(request)) return;
+        String newTok = "";
+        String newTmpl = "";
+        bool newEn = false;
+        if (request->hasParam("token", true)) newTok = request->getParam("token", true)->value();
+        else if (request->hasParam("token", false)) newTok = request->getParam("token", false)->value();
+        newTok.trim();
+
+        if (request->hasParam("tmpl", true)) newTmpl = request->getParam("tmpl", true)->value();
+        else if (request->hasParam("tmpl", false)) newTmpl = request->getParam("tmpl", false)->value();
+        newTmpl.trim();
+
+        String enStr = "";
+        if (request->hasParam("en", true)) enStr = request->getParam("en", true)->value();
+        else if (request->hasParam("en", false)) enStr = request->getParam("en", false)->value();
+        newEn = (enStr == "1" || enStr == "true" || enStr == "on");
+
+        Preferences p;
+        p.begin("pdu_store", false);
+        p.putString("blynk_tok", newTok);
+        p.putString("blynk_tmpl", newTmpl);
+        p.putBool("blynk_en", newEn);
+        p.end();
+
+        g_blynkAuthToken = newTok;
+        g_blynkTemplateId = newTmpl;
+        g_blynkEnabled = newEn;
+        g_blynkNeedReconnect = true;
+
+        request->send(200, "text/plain; charset=utf-8", "OK: Pengaturan Blynk tersimpan! Diperbarui live tanpa restart.");
     });
 
     server.on("/api/failsafe", HTTP_POST, [](AsyncWebServerRequest *request) {
@@ -2121,7 +2545,7 @@ void setup() {
         request->send(200, "text/plain", "NVS_CLEARED");
     });
 
-    // Endpoint Reset Catatan Insiden Blackbox
+    // Endpoint Reset Catatan Insiden Blackbox (Membersihkan 10 Kejadian di NVS)
     server.on("/api/reset-blackbox", HTTP_POST, [](AsyncWebServerRequest *request) {
         if (!checkAuth(request)) return;
         Preferences pBb;
@@ -2129,8 +2553,60 @@ void setup() {
         pBb.clear();
         pBb.end();
         g_hasTripRecord = false;
+        g_tripCount = 0;
+        g_tripHead = 0;
         memset(&g_lastTripRecord, 0, sizeof(g_lastTripRecord));
+        memset(g_tripRecords, 0, sizeof(g_tripRecords));
         request->send(200, "text/plain", "BLACKBOX_CLEARED");
+    });
+
+    // Endpoint Daftar Lengkap Riwayat Insiden (Ring Buffer 10 Kejadian)
+    server.on("/api/trips", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!checkAuth(request)) return;
+        String json = "{";
+        json += "\"bootCount\":" + String(g_bootCount) + ",";
+        json += "\"resetReason\":" + String((int)g_mcuResetReason) + ",";
+        json += "\"resetReasonStr\":\"" + String(getResetReasonStr((uint8_t)g_mcuResetReason)) + "\",";
+        json += "\"lastRst\":" + String(g_lastRstReason) + ",";
+        json += "\"lastRstStr\":\"" + String(getResetReasonStr((uint8_t)g_lastRstReason)) + "\",";
+        json += "\"cNet\":" + String(g_lastCrumbNet) + ",";
+        json += "\"cNetStr\":\"" + String(getCrumbNetStr(g_lastCrumbNet)) + "\",";
+        json += "\"cCtl\":" + String(g_lastCrumbCtl) + ",";
+        json += "\"cCtlStr\":\"" + String(getCrumbCtlStr(g_lastCrumbCtl)) + "\",";
+        json += "\"upS\":" + String(g_lastUptimeS) + ",";
+        json += "\"tripCount\":" + String(g_tripCount) + ",";
+        json += "\"trips\":[";
+
+        bool first = true;
+        for (int i = 0; i < g_tripCount; i++) {
+            int idx = (g_tripHead - 1 - i + BLACKBOX_MAX_RECORDS) % BLACKBOX_MAX_RECORDS;
+            if (idx >= g_tripCount && g_tripCount < BLACKBOX_MAX_RECORDS) continue;
+            const BlackboxRecord &r = g_tripRecords[idx];
+            if (r.magic != 0x50445542) continue;
+
+            if (!first) json += ",";
+            first = false;
+
+            json += "{";
+            json += "\"no\":" + String(i + 1) + ",";
+            json += "\"slot\":" + String(idx) + ",";
+            json += "\"bootCount\":" + String(r.bootCount) + ",";
+            json += "\"timestamp\":" + String(r.timestamp) + ",";
+            json += "\"tripReason\":" + String(r.tripReason) + ",";
+            json += "\"tripLabel\":\"" + String(r.tripLabel) + "\",";
+            json += "\"rstReason\":" + String(r.rstReason) + ",";
+            json += "\"rstReasonStr\":\"" + String(getResetReasonStr(r.rstReason)) + "\",";
+            json += "\"voltage\":" + String(r.voltage, 1) + ",";
+            json += "\"minVolt5s\":" + String(r.minVolt5s, 1) + ",";
+            json += "\"maxVolt5s\":" + String(r.maxVolt5s, 1) + ",";
+            json += "\"current\":" + String(r.current, 2) + ",";
+            json += "\"power\":" + String(r.power, 1) + ",";
+            json += "\"chipTemp\":" + String(r.chipTemp, 1) + ",";
+            json += "\"relayBits\":" + String(r.relayStates);
+            json += "}";
+        }
+        json += "]}";
+        request->send(200, "application/json", json);
     });
 
     // Endpoint Riwayat Telemetri Resolusi 1-Detik dari Octal PSRAM
@@ -2198,6 +2674,7 @@ void setup() {
                 // Kunci level hardware pin relay agar listrik TIDAK MATI sama sekali saat reboot!
                 for (int i = 0; i < 4; i++) {
                     gpio_hold_en((gpio_num_t)RELAY_PINS[i]);
+                    gpio_hold_en((gpio_num_t)RELAY_SS_PINS[i]);
                 }
                 gpio_deep_sleep_hold_en();
                 Serial.println("[OTA] ✅ GPIO Relay di-HOLD! Listrik tetap menyala selama reboot MCU.");
@@ -2252,7 +2729,7 @@ void setup() {
     Serial.println("[HTTP] Web Server 4 Halaman & REST API Aktif!");
 
     // 7. Spawn Core 1 Task (Proteksi Real-Time, Prioritas Tinggi) FIRST
-    xTaskCreatePinnedToCore(TaskControlCore1, "TaskControlCore1", 4096, NULL, 3, NULL, 1);
+    xTaskCreatePinnedToCore(TaskControlCore1, "TaskControlCore1", 8192, NULL, 3, NULL, 1);
 
     // 8. Spawn Core 0 Task (Network, Web Server, Blynk, & mDNS)
     xTaskCreatePinnedToCore(TaskNetworkCore0, "TaskNetworkCore0", 8192, NULL, 1, NULL, 0);
